@@ -1,1 +1,14 @@
+# Environment variables - NEVER COMMIT
+.env
+.env.*
+*.env
 
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
