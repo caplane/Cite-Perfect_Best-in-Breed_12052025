@@ -490,6 +490,21 @@ def get_citation(
     
     metadata, detection = route_citation(query)
     
+    # FALLBACK: If no results, try Semantic Scholar directly (best for messy queries)
+    if not metadata or not metadata.has_minimum_data():
+        print(f"[UnifiedRouter] Primary routing failed, trying Semantic Scholar fallback...")
+        try:
+            metadata = _semantic.search(query)
+            if not metadata:
+                # Try with cleaned query (remove noise words)
+                words = [w for w in query.split() if len(w) > 3 and w.lower() not in 
+                         {'the', 'and', 'for', 'with', 'from', 'that', 'this', 'none', 'could', 'would', 'put'}]
+                if words:
+                    clean_query = ' '.join(words[:5])
+                    metadata = _semantic.search(clean_query)
+        except Exception as e:
+            print(f"[UnifiedRouter] Semantic fallback failed: {e}")
+    
     if not metadata or not metadata.has_minimum_data():
         print(f"[UnifiedRouter] No metadata found for: {query[:50]}...")
         return None, None
@@ -594,13 +609,29 @@ def get_multiple_citations(
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fn) for fn in engine_searches]
         
-        for future in as_completed(futures, timeout=8):
+        for future in as_completed(futures, timeout=10):
             try:
-                engine_results = future.result(timeout=1)
+                # Increased timeout to 3s per result (was 1s, cutting off Semantic Scholar)
+                engine_results = future.result(timeout=3)
                 for source_name, meta in engine_results:
                     add_result(meta, source_name)
             except Exception as e:
                 continue
+    
+    # FALLBACK: For messy queries, try Semantic Scholar with relaxed search if few results
+    if len(results) < 2:
+        print(f"[UnifiedRouter] Few results ({len(results)}), trying Semantic Scholar fallback...")
+        try:
+            # Try with just key words (strip common words)
+            words = [w for w in query.split() if len(w) > 3 and w.lower() not in 
+                     {'the', 'and', 'for', 'with', 'from', 'that', 'this', 'none', 'could', 'would'}]
+            if words:
+                fallback_query = ' '.join(words[:4])  # First 4 significant words
+                meta = _semantic.search(fallback_query)
+                if meta:
+                    add_result(meta, "Semantic Scholar (fuzzy)")
+        except Exception as e:
+            print(f"[UnifiedRouter] Semantic fallback failed: {e}")
     
     # Cache results for future queries
     if results:
