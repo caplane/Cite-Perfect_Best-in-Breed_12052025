@@ -875,6 +875,10 @@ def process_document(
     # Import here to avoid circular imports
     from unified_router import get_citation
     from formatters.base import BaseFormatter, get_formatter
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    
+    # Per-note timeout to prevent indefinite hanging
+    NOTE_TIMEOUT = 8  # seconds per note
     
     results = []
     
@@ -890,6 +894,20 @@ def process_document(
     # Get all endnotes and footnotes
     endnotes = processor.get_endnotes()
     footnotes = processor.get_footnotes()
+    
+    # Helper to call get_citation with timeout
+    def get_citation_with_timeout(text: str, style: str, timeout: int = NOTE_TIMEOUT):
+        """Call get_citation with a timeout wrapper."""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(get_citation, text, style)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeout:
+                print(f"[process_document] Timeout after {timeout}s for: {text[:50]}...")
+                return None, None
+            except Exception as e:
+                print(f"[process_document] Error in get_citation: {e}")
+                return None, None
     
     def process_single_note(note: Dict[str, str], note_type: str) -> ProcessedCitation:
         """
@@ -932,8 +950,8 @@ def process_document(
                     citation_form="ibid"
                 )
             
-            # Case 2+: Process citation to get metadata
-            metadata, full_formatted = get_citation(original_text, style)
+            # Case 2+: Process citation to get metadata (with timeout)
+            metadata, full_formatted = get_citation_with_timeout(original_text, style)
             
             if not metadata or not full_formatted:
                 return ProcessedCitation(
@@ -1037,14 +1055,21 @@ def process_document(
             )
     
     # Process endnotes
-    for note in endnotes:
+    total_notes = len(endnotes) + len(footnotes)
+    print(f"[process_document] Processing {len(endnotes)} endnotes, {len(footnotes)} footnotes ({total_notes} total)")
+    
+    for idx, note in enumerate(endnotes):
+        print(f"[process_document] Processing endnote {idx+1}/{len(endnotes)}: {note.get('text', '')[:40]}...")
         result = process_single_note(note, 'endnote')
         results.append(result)
+        print(f"[process_document] Endnote {idx+1} {'✓' if result.success else '✗'}")
     
     # Process footnotes
-    for note in footnotes:
+    for idx, note in enumerate(footnotes):
+        print(f"[process_document] Processing footnote {idx+1}/{len(footnotes)}: {note.get('text', '')[:40]}...")
         result = process_single_note(note, 'footnote')
         results.append(result)
+        print(f"[process_document] Footnote {idx+1} {'✓' if result.success else '✗'}")
     
     # Save to buffer
     doc_buffer = processor.save_to_buffer()
@@ -1101,6 +1126,9 @@ def update_document_note(doc_bytes: bytes, note_id: int, new_html: str) -> bytes
         for xml_path, note_tag in [(endnotes_path, 'w:endnote'), (footnotes_path, 'w:footnote')]:
             if not os.path.exists(xml_path):
                 continue
+            
+            # Determine note type for styling
+            note_type = 'footnote' if 'footnote' in xml_path else 'endnote'
                 
             with open(xml_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -1113,8 +1141,8 @@ def update_document_note(doc_bytes: bytes, note_id: int, new_html: str) -> bytes
                 open_tag = match.group(1)
                 close_tag = match.group(3)
                 
-                # Convert HTML to Word XML
-                word_xml = html_to_word_xml(new_html)
+                # Convert HTML to Word XML with proper style
+                word_xml = html_to_word_xml(new_html, note_type)
                 
                 return f"{open_tag}{word_xml}{close_tag}"
             
@@ -1139,6 +1167,10 @@ def update_document_note(doc_bytes: bytes, note_id: int, new_html: str) -> bytes
         shutil.rmtree(temp_dir)
         
         output_buffer.seek(0)
+        
+        # Activate any URLs as clickable hyperlinks (use internal LinkActivator)
+        output_buffer = LinkActivator.process(output_buffer)
+        
         return output_buffer.read()
         
     except Exception as e:
@@ -1147,20 +1179,28 @@ def update_document_note(doc_bytes: bytes, note_id: int, new_html: str) -> bytes
         return doc_bytes
 
 
-def html_to_word_xml(html: str) -> str:
+def html_to_word_xml(html: str, note_type: str = 'endnote') -> str:
     """
-    Convert simple HTML to Word XML for endnote content.
+    Convert simple HTML to Word XML for endnote/footnote content.
     
     Handles:
     - <i>text</i> → italic runs
     - Plain text → normal runs
-    - Basic structure preservation
+    - Applies proper paragraph style (EndnoteText/FootnoteText)
+    
+    Updated: 2025-12-05 - Added paragraph style to fix font size issue
     """
     import re
     import html as html_module
     
     # Unescape HTML entities
     text = html_module.unescape(html)
+    
+    # Determine paragraph style based on note type
+    if note_type == 'footnote':
+        style_name = 'FootnoteText'
+    else:
+        style_name = 'EndnoteText'
     
     # Build Word XML paragraph
     runs = []
@@ -1182,5 +1222,5 @@ def html_to_word_xml(html: str) -> str:
             escaped = part.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             runs.append(f'<w:r><w:t xml:space="preserve">{escaped}</w:t></w:r>')
     
-    # Wrap in paragraph
-    return f'<w:p>{"".join(runs)}</w:p>'
+    # Wrap in paragraph WITH style
+    return f'<w:p><w:pPr><w:pStyle w:val="{style_name}"/></w:pPr>{"".join(runs)}</w:p>'
