@@ -11,12 +11,12 @@ KEY IMPROVEMENTS OVER ORIGINAL router.py:
 1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
    during detection (not just regex patterns that miss bare case names)
 2. Legal extraction uses superlegal.extract_metadata() for cache + CourtListener API
-3. Book search uses engines/books.py's GoogleBooksAPI + OpenLibraryAPI with PUBLISHER_PLACE_MAP
+3. Book search uses books.py's GoogleBooksAPI + OpenLibraryAPI with PUBLISHER_PLACE_MAP
 4. Academic search uses CiteFlex Pro's parallel engine execution
 5. Medical URL override prevents PubMed/NIH URLs from routing to government
 
 ARCHITECTURE:
-- Wrapper classes convert engines/superlegal.py and engines/books.py dicts → CitationMetadata
+- Wrapper classes convert superlegal.py/books.py dicts → CitationMetadata
 - Parallel execution via ThreadPoolExecutor (12s timeout)
 - Routing priority: Legal → URL handling → Parallel search → Fallback
 """
@@ -35,7 +35,7 @@ from formatters.base import get_formatter
 from engines.academic import CrossrefEngine, OpenAlexEngine, SemanticScholarEngine, PubMedEngine
 from engines.doi import extract_doi_from_url, is_academic_publisher_url
 
-# Import Cite Fix Pro modules (at root level)
+# Import Cite Fix Pro modules (now in engines/)
 from engines import superlegal
 from engines import books
 
@@ -44,7 +44,7 @@ from engines import books
 # CONFIGURATION
 # =============================================================================
 
-PARALLEL_TIMEOUT = 6  # seconds (reduced from 12 for faster response)
+PARALLEL_TIMEOUT = 12  # seconds
 MAX_WORKERS = 4
 
 # Medical domains that should NOT route to government engine
@@ -58,69 +58,6 @@ MEDICAL_DOMAINS = ['pubmed', 'ncbi.nlm.nih.gov', 'nih.gov/health', 'medlineplus'
 _crossref = CrossrefEngine()
 _openalex = OpenAlexEngine()
 _semantic = SemanticScholarEngine()
-
-
-# =============================================================================
-# RESULTS CACHE (speeds up repeated queries)
-# =============================================================================
-
-import time
-import threading
-import hashlib
-
-class ResultsCache:
-    """
-    Thread-safe cache for citation search results.
-    Speeds up repeated queries significantly.
-    
-    Added: 2025-12-05 15:30
-    """
-    
-    TTL_SECONDS = 1800  # 30 minutes
-    MAX_SIZE = 200      # Maximum cached queries
-    
-    def __init__(self):
-        self._cache = {}
-        self._lock = threading.Lock()
-    
-    def _make_key(self, query: str, style: str) -> str:
-        """Create cache key from query + style."""
-        normalized = f"{query.lower().strip()}|{style}"
-        return hashlib.md5(normalized.encode()).hexdigest()[:16]
-    
-    def get(self, query: str, style: str):
-        """Get cached results if not expired."""
-        key = self._make_key(query, style)
-        with self._lock:
-            if key in self._cache:
-                results, timestamp = self._cache[key]
-                if time.time() - timestamp < self.TTL_SECONDS:
-                    print(f"[Cache] HIT for: {query[:30]}...")
-                    return results
-                else:
-                    del self._cache[key]  # Expired
-        return None
-    
-    def set(self, query: str, style: str, results):
-        """Cache results with timestamp."""
-        key = self._make_key(query, style)
-        with self._lock:
-            # Evict oldest if at capacity
-            if len(self._cache) >= self.MAX_SIZE:
-                oldest_key = min(self._cache.keys(), 
-                               key=lambda k: self._cache[k][1])
-                del self._cache[oldest_key]
-            
-            self._cache[key] = (results, time.time())
-            print(f"[Cache] STORED: {query[:30]}... ({len(self._cache)} cached)")
-    
-    def clear(self):
-        """Clear all cached results."""
-        with self._lock:
-            self._cache.clear()
-
-# Global cache instance
-_results_cache = ResultsCache()
 _pubmed = PubMedEngine()
 
 
@@ -482,28 +419,7 @@ def get_citation(
         Tuple of (CitationMetadata, formatted_citation_string)
         Both may be None if lookup fails.
     """
-    # Check cache first (use "single:" prefix to distinguish from multiple)
-    cache_key = f"single:{query}"
-    cached = _results_cache.get(cache_key, style)
-    if cached is not None:
-        return cached
-    
     metadata, detection = route_citation(query)
-    
-    # FALLBACK: If no results, try Semantic Scholar directly (best for messy queries)
-    if not metadata or not metadata.has_minimum_data():
-        print(f"[UnifiedRouter] Primary routing failed, trying Semantic Scholar fallback...")
-        try:
-            metadata = _semantic.search(query)
-            if not metadata:
-                # Try with cleaned query (remove noise words)
-                words = [w for w in query.split() if len(w) > 3 and w.lower() not in 
-                         {'the', 'and', 'for', 'with', 'from', 'that', 'this', 'none', 'could', 'would', 'put'}]
-                if words:
-                    clean_query = ' '.join(words[:5])
-                    metadata = _semantic.search(clean_query)
-        except Exception as e:
-            print(f"[UnifiedRouter] Semantic fallback failed: {e}")
     
     if not metadata or not metadata.has_minimum_data():
         print(f"[UnifiedRouter] No metadata found for: {query[:50]}...")
@@ -512,9 +428,6 @@ def get_citation(
     formatter = get_formatter(style)
     formatted = formatter.format(metadata)
     
-    # Cache the result
-    _results_cache.set(cache_key, style, (metadata, formatted))
-    
     return metadata, formatted
 
 
@@ -522,9 +435,9 @@ def get_multiple_citations(
     query: str,
     style: str = "Chicago Manual of Style",
     limit: int = 5
-) -> List[Tuple[CitationMetadata, str, str]]:
+) -> List[Tuple[CitationMetadata, str]]:
     """
-    Get multiple citation options from ALL relevant engines in parallel.
+    Get multiple citation options for a query.
     
     Args:
         query: Search query
@@ -532,138 +445,41 @@ def get_multiple_citations(
         limit: Maximum results
         
     Returns:
-        List of (CitationMetadata, formatted_string, source_name) tuples
+        List of (CitationMetadata, formatted_string) tuples
     """
-    # Check cache first (instant return if hit)
-    cached = _results_cache.get(query, style)
-    if cached is not None:
-        return cached[:limit]
-    
     results = []
     formatter = get_formatter(style)
-    seen_titles = set()  # Deduplicate by title
     
-    def add_result(meta, source_name, priority=False):
-        """Add result if valid and not duplicate. Priority results go first."""
-        if meta and meta.has_minimum_data():
-            # Use case_name for legal, title for everything else
-            if meta.citation_type == CitationType.LEGAL:
-                dedup_key = (meta.case_name or '').lower()[:50]
-            else:
-                dedup_key = (meta.title or '').lower()[:50]
-            if dedup_key and dedup_key not in seen_titles:
-                seen_titles.add(dedup_key)
-                formatted = formatter.format(meta)
-                if priority:
-                    results.insert(0, (meta, formatted, source_name))
-                else:
-                    results.append((meta, formatted, source_name))
-    
-    # 1. LEGAL CHECK FIRST - if it's a legal citation, return ONLY the legal result
+    # Check if legal first
     if superlegal.is_legal_citation(query):
-        print(f"[get_multiple] Detected legal citation: {query[:40]}...")
+        # Legal only returns one result from cache/API
         metadata = _route_legal(query)
         if metadata:
-            add_result(metadata, "Legal Cache", priority=True)
-            # For legal citations, return immediately - don't query academic engines
-            if results:
-                _results_cache.set(query, style, results)
-                return results[:limit]
+            formatted = formatter.format(metadata)
+            results.append((metadata, formatted))
+        return results
     
-    # 2. Query engines in parallel (skip if legal already found)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # For other types, try to get multiple from Crossref
+    detection = detect_type(query)
     
-    def search_crossref():
+    if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL, CitationType.UNKNOWN]:
+        metadatas = _crossref.search_multiple(query, limit)
+        for meta in metadatas:
+            if meta and meta.has_minimum_data():
+                formatted = formatter.format(meta)
+                results.append((meta, formatted))
+    
+    elif detection.citation_type == CitationType.BOOK:
+        # Books.py returns a list already
         try:
-            metas = _crossref.search_multiple(query, 2)
-            return [("Crossref", m) for m in metas if m]
-        except: return []
-    
-    def search_openalex():
-        try:
-            meta = _openalex.search(query)
-            return [("OpenAlex", meta)] if meta else []
-        except: return []
-    
-    def search_semantic():
-        try:
-            meta = _semantic.search(query)
-            return [("Semantic Scholar", meta)] if meta else []
-        except: return []
-    
-    def search_pubmed():
-        try:
-            meta = _pubmed.search(query)
-            return [("PubMed", meta)] if meta else []
-        except: return []
-    
-    def search_books():
-        try:
-            print(f"[search_books] Searching all book engines for: {query[:50]}...")
-            # Use search_all_engines to get results from ALL book APIs
-            book_results = books.search_all_engines(query)
-            print(f"[search_books] Got {len(book_results) if book_results else 0} results from all engines")
-            results = []
-            for data in book_results[:4]:  # Up to 4 book results
+            book_results = books.extract_metadata(query)
+            for data in book_results[:limit]:
                 meta = _book_dict_to_metadata(data, query)
                 if meta:
-                    # Use source_engine from books.py (Google Books, LOC, WorldCat, Open Library)
-                    source = data.get('source_engine', 'Books')
-                    results.append((source, meta))
-                    print(f"[search_books] Found: {meta.title[:50] if meta.title else 'No title'}... [{source}]")
-            return results
-        except Exception as e:
-            print(f"[search_books] Error: {e}")
-            return []
-    
-    # Run all searches in parallel
-    engine_searches = [
-        search_crossref,
-        search_openalex, 
-        search_semantic,
-        search_pubmed,
-        search_books,
-    ]
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(fn) for fn in engine_searches]
-        
-        for future in as_completed(futures, timeout=10):
-            try:
-                # Increased timeout to 3s per result (was 1s, cutting off Semantic Scholar)
-                engine_results = future.result(timeout=3)
-                for source_name, meta in engine_results:
-                    add_result(meta, source_name)
-            except Exception as e:
-                continue
-    
-    # FALLBACK: For messy queries, try Semantic Scholar with relaxed search if few results
-    if len(results) < 2:
-        print(f"[UnifiedRouter] Few results ({len(results)}), trying Semantic Scholar fallback...")
-        try:
-            # Try with just key words (strip common words)
-            words = [w for w in query.split() if len(w) > 3 and w.lower() not in 
-                     {'the', 'and', 'for', 'with', 'from', 'that', 'this', 'none', 'could', 'would'}]
-            if words:
-                fallback_query = ' '.join(words[:4])  # First 4 significant words
-                meta = _semantic.search(fallback_query)
-                if meta:
-                    add_result(meta, "Semantic Scholar (fuzzy)")
-        except Exception as e:
-            print(f"[UnifiedRouter] Semantic fallback failed: {e}")
-    
-    # PRIORITIZE BOOK RESULTS: Move book-type results to front if query looks like a book
-    # (contains author name patterns, no volume/issue numbers)
-    book_results = [(m, f, s) for m, f, s in results if m.citation_type == CitationType.BOOK]
-    if book_results and not any(c.isdigit() for c in query.split()[-1] if len(query.split()[-1]) < 5):
-        # Reorder: books first, then others
-        other_results = [(m, f, s) for m, f, s in results if m.citation_type != CitationType.BOOK]
-        results = book_results + other_results
-        print(f"[UnifiedRouter] Prioritized {len(book_results)} book results")
-    
-    # Cache results for future queries
-    if results:
-        _results_cache.set(query, style, results)
+                    formatted = formatter.format(meta)
+                    results.append((meta, formatted))
+        except Exception:
+            pass
     
     return results[:limit]
 
