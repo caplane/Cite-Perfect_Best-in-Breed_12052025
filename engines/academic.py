@@ -16,6 +16,9 @@ from engines.base import SearchEngine
 from models import CitationMetadata, CitationType
 from config import PUBMED_API_KEY, SEMANTIC_SCHOLAR_API_KEY
 
+# Shorter timeout for faster failures
+ENGINE_TIMEOUT = 5  # seconds
+
 
 class CrossrefEngine(SearchEngine):
     """
@@ -263,12 +266,12 @@ class SemanticScholarEngine(SearchEngine):
     def search(self, query: str) -> Optional[CitationMetadata]:
         """
         Search with author-aware matching.
-        Gets top 5 results, scores by author/title match, returns best.
+        Gets top 10 results, scores by author/title match, returns best.
         """
         headers = self._get_headers()
         params = {
             'query': query,
-            'limit': 5,
+            'limit': 10,  # Increased from 5 for better fuzzy matching
             'fields': 'paperId,title,authors'
         }
         
@@ -296,10 +299,14 @@ class SemanticScholarEngine(SearchEngine):
             return None
     
     def _find_best_match(self, papers: List[dict], query: str) -> dict:
-        """Score papers and return best match."""
+        """Score papers and return best match. Enhanced for messy queries."""
         query_lower = query.lower()
         best_match = papers[0]
         best_score = 0
+        
+        # Extract significant words from query (3+ chars, not stopwords)
+        stopwords = {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'for', 'to', 'none', 'could', 'would', 'put'}
+        query_words = [w for w in query_lower.split() if len(w) >= 3 and w not in stopwords]
         
         for paper in papers:
             score = 0
@@ -315,15 +322,21 @@ class SemanticScholarEngine(SearchEngine):
                     first_name = parts[0] if len(parts) > 1 else ''
                     
                     if last_name and len(last_name) > 2 and last_name in query_lower:
-                        score += 10
+                        score += 15  # Boosted author match weight
                     if first_name and len(first_name) > 2 and first_name in query_lower:
-                        score += 5
+                        score += 8
             
-            # Check title word overlap
-            query_words = set(query_lower.split()) - {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'for', 'to'}
-            title_words = set(title.split()) - {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'for', 'to'}
-            overlap = len(query_words & title_words)
-            score += overlap * 2
+            # Check title word overlap (exact)
+            title_words = set(title.split()) - stopwords
+            exact_overlap = len(set(query_words) & title_words)
+            score += exact_overlap * 3
+            
+            # Check partial word matches (e.g., "train" in "training", "brain" in "brains")
+            for qword in query_words:
+                if len(qword) >= 4:  # Only for 4+ char words
+                    for tword in title_words:
+                        if qword[:4] in tword or tword[:4] in qword:
+                            score += 2  # Partial match bonus
             
             if score > best_score:
                 best_score = score
