@@ -614,6 +614,22 @@ def get_multiple_citations(
                         results.append((meta, formatted, "Crossref"))
             except Exception:
                 pass
+        
+        # Also try Semantic Scholar - "author title" could be a journal article
+        if len(results) < limit:
+            try:
+                ss_result = _semantic.search(query)
+                if ss_result and ss_result.has_minimum_data():
+                    is_duplicate = any(
+                        ss_result.title and r[0].title and 
+                        ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                        for r in results
+                    )
+                    if not is_duplicate:
+                        formatted = formatter.format(ss_result)
+                        results.append((ss_result, formatted, "Semantic Scholar"))
+            except Exception:
+                pass
     
     elif detection.citation_type == CitationType.UNKNOWN:
         # Try Gemini AI to classify ambiguous queries
@@ -634,6 +650,21 @@ def get_multiple_citations(
                                 results.append((meta, formatted, source))
                     except Exception:
                         pass
+                    # Also try Semantic Scholar - "author title" could be a journal article
+                    if len(results) < limit:
+                        try:
+                            ss_result = _semantic.search(query)
+                            if ss_result and ss_result.has_minimum_data():
+                                is_duplicate = any(
+                                    ss_result.title and r[0].title and 
+                                    ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                                    for r in results
+                                )
+                                if not is_duplicate:
+                                    formatted = formatter.format(ss_result)
+                                    results.append((ss_result, formatted, "Semantic Scholar"))
+                        except Exception:
+                            pass
                     return results[:limit]
                 
                 elif gemini_type == CitationType.LEGAL:
