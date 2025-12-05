@@ -435,7 +435,7 @@ def get_multiple_citations(
     query: str,
     style: str = "Chicago Manual of Style",
     limit: int = 5
-) -> List[Tuple[CitationMetadata, str]]:
+) -> List[Tuple[CitationMetadata, str, str]]:
     """
     Get multiple citation options for a query.
     
@@ -445,7 +445,7 @@ def get_multiple_citations(
         limit: Maximum results
         
     Returns:
-        List of (CitationMetadata, formatted_string) tuples
+        List of (CitationMetadata, formatted_string, source_name) tuples
     """
     results = []
     formatter = get_formatter(style)
@@ -456,7 +456,8 @@ def get_multiple_citations(
         metadata = _route_legal(query)
         if metadata:
             formatted = formatter.format(metadata)
-            results.append((metadata, formatted))
+            source = metadata.source_engine or "Legal Cache"
+            results.append((metadata, formatted, source))
         return results
     
     # For other types, try to get multiple from Crossref
@@ -467,7 +468,8 @@ def get_multiple_citations(
         for meta in metadatas:
             if meta and meta.has_minimum_data():
                 formatted = formatter.format(meta)
-                results.append((meta, formatted))
+                source = meta.source_engine or "Crossref"
+                results.append((meta, formatted, source))
     
     elif detection.citation_type == CitationType.BOOK:
         # Books.py returns a list already
@@ -477,7 +479,8 @@ def get_multiple_citations(
                 meta = _book_dict_to_metadata(data, query)
                 if meta:
                     formatted = formatter.format(meta)
-                    results.append((meta, formatted))
+                    source = meta.source_engine or data.get('source_engine', 'Google Books')
+                    results.append((meta, formatted, source))
         except Exception:
             pass
     
