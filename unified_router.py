@@ -587,15 +587,22 @@ def get_multiple_citations(
     
     def search_books():
         try:
-            book_results = books.extract_metadata(query)
+            print(f"[search_books] Searching all book engines for: {query[:50]}...")
+            # Use search_all_engines to get results from ALL book APIs
+            book_results = books.search_all_engines(query)
+            print(f"[search_books] Got {len(book_results) if book_results else 0} results from all engines")
             results = []
-            for data in book_results[:2]:
+            for data in book_results[:4]:  # Up to 4 book results
                 meta = _book_dict_to_metadata(data, query)
                 if meta:
-                    source = data.get('source', 'Books')
+                    # Use source_engine from books.py (Google Books, LOC, WorldCat, Open Library)
+                    source = data.get('source_engine', 'Books')
                     results.append((source, meta))
+                    print(f"[search_books] Found: {meta.title[:50] if meta.title else 'No title'}... [{source}]")
             return results
-        except: return []
+        except Exception as e:
+            print(f"[search_books] Error: {e}")
+            return []
     
     # Run all searches in parallel
     engine_searches = [
