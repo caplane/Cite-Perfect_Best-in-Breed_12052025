@@ -44,7 +44,7 @@ import books
 # CONFIGURATION
 # =============================================================================
 
-PARALLEL_TIMEOUT = 12  # seconds
+PARALLEL_TIMEOUT = 6  # seconds (reduced from 12 for faster response)
 MAX_WORKERS = 4
 
 # Medical domains that should NOT route to government engine
@@ -435,9 +435,9 @@ def get_multiple_citations(
     query: str,
     style: str = "Chicago Manual of Style",
     limit: int = 5
-) -> List[Tuple[CitationMetadata, str]]:
+) -> List[Tuple[CitationMetadata, str, str]]:
     """
-    Get multiple citation options for a query.
+    Get multiple citation options from ALL relevant engines in parallel.
     
     Args:
         query: Search query
@@ -445,41 +445,85 @@ def get_multiple_citations(
         limit: Maximum results
         
     Returns:
-        List of (CitationMetadata, formatted_string) tuples
+        List of (CitationMetadata, formatted_string, source_name) tuples
     """
     results = []
     formatter = get_formatter(style)
+    seen_titles = set()  # Deduplicate by title
     
-    # Check if legal first
+    def add_result(meta, source_name):
+        """Add result if valid and not duplicate."""
+        if meta and meta.has_minimum_data():
+            title_key = (meta.title or '').lower()[:50]
+            if title_key and title_key not in seen_titles:
+                seen_titles.add(title_key)
+                formatted = formatter.format(meta)
+                results.append((meta, formatted, source_name))
+    
+    # 1. Always check legal cache first (instant)
     if court.is_legal_citation(query):
-        # Legal only returns one result from cache/API
         metadata = _route_legal(query)
         if metadata:
-            formatted = formatter.format(metadata)
-            results.append((metadata, formatted))
-        return results
+            add_result(metadata, "Legal Cache")
     
-    # For other types, try to get multiple from Crossref
-    detection = detect_type(query)
+    # 2. Query ALL engines in parallel
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     
-    if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL, CitationType.UNKNOWN]:
-        metadatas = _crossref.search_multiple(query, limit)
-        for meta in metadatas:
-            if meta and meta.has_minimum_data():
-                formatted = formatter.format(meta)
-                results.append((meta, formatted))
+    def search_crossref():
+        try:
+            metas = _crossref.search_multiple(query, 2)
+            return [("Crossref", m) for m in metas if m]
+        except: return []
     
-    elif detection.citation_type == CitationType.BOOK:
-        # Books.py returns a list already
+    def search_openalex():
+        try:
+            meta = _openalex.search(query)
+            return [("OpenAlex", meta)] if meta else []
+        except: return []
+    
+    def search_semantic():
+        try:
+            meta = _semantic.search(query)
+            return [("Semantic Scholar", meta)] if meta else []
+        except: return []
+    
+    def search_pubmed():
+        try:
+            meta = _pubmed.search(query)
+            return [("PubMed", meta)] if meta else []
+        except: return []
+    
+    def search_books():
         try:
             book_results = books.extract_metadata(query)
-            for data in book_results[:limit]:
+            results = []
+            for data in book_results[:2]:
                 meta = _book_dict_to_metadata(data, query)
                 if meta:
-                    formatted = formatter.format(meta)
-                    results.append((meta, formatted))
-        except Exception:
-            pass
+                    source = data.get('source', 'Books')
+                    results.append((source, meta))
+            return results
+        except: return []
+    
+    # Run all searches in parallel
+    engine_searches = [
+        search_crossref,
+        search_openalex, 
+        search_semantic,
+        search_pubmed,
+        search_books,
+    ]
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(fn) for fn in engine_searches]
+        
+        for future in as_completed(futures, timeout=8):
+            try:
+                engine_results = future.result(timeout=1)
+                for source_name, meta in engine_results:
+                    add_result(meta, source_name)
+            except Exception as e:
+                continue
     
     return results[:limit]
 

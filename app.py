@@ -275,9 +275,12 @@ def cite_multiple():
             'results': [
                 {
                     'citation': formatted,
+                    'source': source,
+                    'type': meta.citation_type.name.lower() if meta and meta.citation_type else 'unknown',
+                    'confidence': 'high' if (meta and (meta.doi or meta.citation)) else 'medium',
                     'metadata': meta.to_dict() if meta else None
                 }
-                for meta, formatted in results
+                for meta, formatted, source in results
             ]
         })
         
