@@ -566,12 +566,30 @@ def get_multiple_citations(
     detection = detect_type(query)
     
     if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
+        # Try Crossref first
         metadatas = _crossref.search_multiple(query, limit)
         for meta in metadatas:
             if meta and meta.has_minimum_data():
                 formatted = formatter.format(meta)
                 source = meta.source_engine or "Crossref"
                 results.append((meta, formatted, source))
+        
+        # Also try Semantic Scholar if we have room (catches author+title queries better)
+        if len(results) < limit:
+            try:
+                ss_result = _semantic.search(query)
+                if ss_result and ss_result.has_minimum_data():
+                    # Avoid duplicates by checking title similarity
+                    is_duplicate = any(
+                        ss_result.title and r[0].title and 
+                        ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                        for r in results
+                    )
+                    if not is_duplicate:
+                        formatted = formatter.format(ss_result)
+                        results.append((ss_result, formatted, "Semantic Scholar"))
+            except Exception:
+                pass
     
     elif detection.citation_type == CitationType.BOOK:
         # Query book engines
@@ -631,6 +649,21 @@ def get_multiple_citations(
                         if meta and meta.has_minimum_data():
                             formatted = formatter.format(meta)
                             results.append((meta, formatted, "Crossref"))
+                    # Also try Semantic Scholar (better for author+title queries)
+                    if len(results) < limit:
+                        try:
+                            ss_result = _semantic.search(query)
+                            if ss_result and ss_result.has_minimum_data():
+                                is_duplicate = any(
+                                    ss_result.title and r[0].title and 
+                                    ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                                    for r in results
+                                )
+                                if not is_duplicate:
+                                    formatted = formatter.format(ss_result)
+                                    results.append((ss_result, formatted, "Semantic Scholar"))
+                        except Exception:
+                            pass
                     return results[:limit]
         
         # Fallback: try book engines FIRST (often what users want)
@@ -653,6 +686,22 @@ def get_multiple_citations(
                     if meta and meta.has_minimum_data():
                         formatted = formatter.format(meta)
                         results.append((meta, formatted, "Crossref"))
+            except Exception:
+                pass
+        
+        # Finally try Semantic Scholar (best for author+title queries like "caplan trains brains")
+        if len(results) < limit:
+            try:
+                ss_result = _semantic.search(query)
+                if ss_result and ss_result.has_minimum_data():
+                    is_duplicate = any(
+                        ss_result.title and r[0].title and 
+                        ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                        for r in results
+                    )
+                    if not is_duplicate:
+                        formatted = formatter.format(ss_result)
+                        results.append((ss_result, formatted, "Semantic Scholar"))
             except Exception:
                 pass
     
