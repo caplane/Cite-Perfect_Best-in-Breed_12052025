@@ -543,22 +543,30 @@ def get_multiple_citations(
     formatter = get_formatter(style)
     seen_titles = set()  # Deduplicate by title
     
-    def add_result(meta, source_name):
-        """Add result if valid and not duplicate."""
+    def add_result(meta, source_name, priority=False):
+        """Add result if valid and not duplicate. Priority results go first."""
         if meta and meta.has_minimum_data():
             title_key = (meta.title or '').lower()[:50]
             if title_key and title_key not in seen_titles:
                 seen_titles.add(title_key)
                 formatted = formatter.format(meta)
-                results.append((meta, formatted, source_name))
+                if priority:
+                    results.insert(0, (meta, formatted, source_name))
+                else:
+                    results.append((meta, formatted, source_name))
     
-    # 1. Always check legal cache first (instant)
+    # 1. LEGAL CHECK FIRST - if it's a legal citation, return ONLY the legal result
     if court.is_legal_citation(query):
+        print(f"[get_multiple] Detected legal citation: {query[:40]}...")
         metadata = _route_legal(query)
         if metadata:
-            add_result(metadata, "Legal Cache")
+            add_result(metadata, "Legal Cache", priority=True)
+            # For legal citations, return immediately - don't query academic engines
+            if results:
+                _results_cache.set(query, style, results)
+                return results[:limit]
     
-    # 2. Query ALL engines in parallel
+    # 2. Query engines in parallel (skip if legal already found)
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     def search_crossref():
@@ -639,6 +647,15 @@ def get_multiple_citations(
                     add_result(meta, "Semantic Scholar (fuzzy)")
         except Exception as e:
             print(f"[UnifiedRouter] Semantic fallback failed: {e}")
+    
+    # PRIORITIZE BOOK RESULTS: Move book-type results to front if query looks like a book
+    # (contains author name patterns, no volume/issue numbers)
+    book_results = [(m, f, s) for m, f, s in results if m.citation_type == CitationType.BOOK]
+    if book_results and not any(c.isdigit() for c in query.split()[-1] if len(query.split()[-1]) < 5):
+        # Reorder: books first, then others
+        other_results = [(m, f, s) for m, f, s in results if m.citation_type != CitationType.BOOK]
+        results = book_results + other_results
+        print(f"[UnifiedRouter] Prioritized {len(book_results)} book results")
     
     # Cache results for future queries
     if results:

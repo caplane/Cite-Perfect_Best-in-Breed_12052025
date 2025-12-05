@@ -1,17 +1,28 @@
 """
 citeflex/books.py
 
-Book citation metadata extraction using Open Library and Google Books APIs.
-Includes publisher-to-place mapping for Chicago Manual of Style compliance.
+Book citation metadata extraction using multiple APIs.
+
+Engines (in priority order):
+1. Open Library - ISBN lookup (precise)
+2. Google Books - fuzzy search (robust)
+3. Library of Congress - US publications (authoritative)
+4. WorldCat - global catalog (comprehensive, requires API key)
+5. Open Library Search - fallback
 
 Version History:
     2025-12-05 12:53: Expanded PUBLISHER_PLACE_MAP with 40+ publishers including
                       Basic Books, Free Press, Johns Hopkins, Duke, and regional presses
     2025-12-05 13:15: Verified all publisher mappings work (17/17 tests pass)
+    2025-12-05 18:50: Added Library of Congress and WorldCat APIs
 """
 
 import requests
 import re
+import os
+
+# WorldCat API key (optional - get from https://www.worldcat.org/webservices/)
+WORLDCAT_API_KEY = os.environ.get('WORLDCAT_API_KEY', '')
 
 # ==================== DATA: PUBLISHER MAPPING ====================
 # Preserved from original citation.py to ensure city data is filled
@@ -82,10 +93,11 @@ def resolve_place(publisher, current_place):
 # ==================== ENGINE 1: OPEN LIBRARY (New / Precise) ====================
 class OpenLibraryAPI:
     """
-    Best for: Queries where an ISBN is detected.
+    Best for: Queries where an ISBN is detected, or as backup for title searches.
     Returns: Highly structured, accurate data.
     """
     BASE_URL = "https://openlibrary.org/api/books"
+    SEARCH_URL = "https://openlibrary.org/search.json"
 
     @staticmethod
     def get_by_isbn(isbn):
@@ -138,9 +150,57 @@ class OpenLibraryAPI:
                     'raw_source': f"ISBN: {clean_isbn}"
                 }]
         except Exception as e:
-            print(f"OpenLibrary Error: {e}")
+            print(f"OpenLibrary ISBN Error: {e}")
             pass
         return []
+    
+    @staticmethod
+    def search(query):
+        """
+        Search Open Library by title/author.
+        Added as fallback when Google Books fails.
+        """
+        try:
+            params = {
+                'q': query,
+                'limit': 3,
+                'fields': 'title,author_name,publisher,publish_year,isbn'
+            }
+            
+            response = requests.get(OpenLibraryAPI.SEARCH_URL, params=params, timeout=5)
+            data = response.json()
+            
+            candidates = []
+            for doc in data.get('docs', [])[:3]:
+                # Get first author
+                authors = doc.get('author_name', [])
+                
+                # Get first publisher
+                publishers = doc.get('publisher', [])
+                publisher = publishers[0] if publishers else ''
+                
+                # Get most recent year
+                years = doc.get('publish_year', [])
+                year = str(max(years)) if years else ''
+                
+                # Resolve place from publisher
+                place = resolve_place(publisher, '')
+                
+                candidates.append({
+                    'type': 'book',
+                    'authors': authors,
+                    'title': doc.get('title', ''),
+                    'publisher': publisher,
+                    'place': place,
+                    'year': year,
+                    'source_engine': 'Open Library',
+                    'raw_source': query
+                })
+            
+            return candidates
+        except Exception as e:
+            print(f"OpenLibrary Search Error: {e}")
+            return []
 
 # ==================== ENGINE 2: GOOGLE BOOKS (Legacy / Robust) ====================
 class GoogleBooksAPI:
@@ -202,13 +262,282 @@ class GoogleBooksAPI:
                         'source_engine': 'Google Books',
                         'raw_source': query
                     })
-        except Exception:
-            pass
+            else:
+                print(f"[GoogleBooks] HTTP {response.status_code} for query: {query[:30]}...")
+        except Exception as e:
+            print(f"[GoogleBooks] Error: {e}")
         return candidates
+
+
+# ==================== ENGINE 3: LIBRARY OF CONGRESS ====================
+class LibraryOfCongressAPI:
+    """
+    Search the Library of Congress catalog.
+    Best for: US publications, historical works, government documents.
+    No API key required.
+    
+    Added: 2025-12-05
+    """
+    SEARCH_URL = "https://www.loc.gov/books/"
+    
+    @staticmethod
+    def search(query):
+        """Search LOC catalog by keyword."""
+        if not query:
+            return []
+        
+        candidates = []
+        try:
+            params = {
+                'q': query,
+                'fo': 'json',
+                'c': 3  # max 3 results
+            }
+            
+            response = requests.get(LibraryOfCongressAPI.SEARCH_URL, params=params, timeout=8)
+            
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('results', [])
+                
+                for item in results[:3]:
+                    # Extract title
+                    title = item.get('title', '')
+                    if isinstance(title, list):
+                        title = title[0] if title else ''
+                    
+                    # Extract authors/contributors
+                    contributors = item.get('contributor', [])
+                    if isinstance(contributors, str):
+                        contributors = [contributors]
+                    authors = [c for c in contributors if c]
+                    
+                    # Extract date
+                    date_str = item.get('date', '')
+                    if isinstance(date_str, list):
+                        date_str = date_str[0] if date_str else ''
+                    year_match = re.search(r'\d{4}', str(date_str))
+                    year = year_match.group(0) if year_match else ''
+                    
+                    # Extract publisher (from item description)
+                    item_desc = item.get('item', {})
+                    if isinstance(item_desc, dict):
+                        created_published = item_desc.get('created_published', '')
+                    else:
+                        created_published = ''
+                    
+                    # Try to extract publisher from created_published string
+                    publisher = ''
+                    place = ''
+                    if created_published:
+                        # Format often: "New York : Simon & Schuster, 2023"
+                        if ':' in created_published:
+                            parts = created_published.split(':')
+                            place = parts[0].strip()
+                            if len(parts) > 1 and ',' in parts[1]:
+                                publisher = parts[1].split(',')[0].strip()
+                    
+                    if not place:
+                        place = resolve_place(publisher, '')
+                    
+                    if title:  # Only add if we have a title
+                        candidates.append({
+                            'type': 'book',
+                            'authors': authors,
+                            'title': title.rstrip('.'),
+                            'publisher': publisher,
+                            'place': place,
+                            'year': year,
+                            'source_engine': 'Library of Congress',
+                            'raw_source': query
+                        })
+            else:
+                print(f"[LOC] HTTP {response.status_code} for query: {query[:30]}...")
+                
+        except Exception as e:
+            print(f"[LOC] Error: {e}")
+        
+        return candidates
+
+
+# ==================== ENGINE 4: WORLDCAT ====================
+class WorldCatAPI:
+    """
+    Search WorldCat global library catalog (3+ billion items).
+    Best for: Academic books, international publications, comprehensive coverage.
+    Requires API key from https://www.worldcat.org/webservices/
+    
+    Set WORLDCAT_API_KEY environment variable in Railway.
+    
+    Added: 2025-12-05
+    """
+    SEARCH_URL = "https://www.worldcat.org/webservices/catalog/search/worldcat/opensearch"
+    
+    @staticmethod
+    def search(query):
+        """Search WorldCat by keyword."""
+        if not query or not WORLDCAT_API_KEY:
+            if not WORLDCAT_API_KEY:
+                print("[WorldCat] No API key configured (set WORLDCAT_API_KEY)")
+            return []
+        
+        candidates = []
+        try:
+            params = {
+                'q': query,
+                'format': 'json',
+                'wskey': WORLDCAT_API_KEY,
+                'count': 3
+            }
+            
+            response = requests.get(WorldCatAPI.SEARCH_URL, params=params, timeout=8)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # WorldCat returns results in various formats
+                items = data.get('entries', data.get('items', []))
+                
+                for item in items[:3]:
+                    # Extract fields (WorldCat format varies)
+                    title = item.get('title', '')
+                    
+                    # Authors may be in 'author' or 'creator'
+                    author_data = item.get('author', item.get('creator', []))
+                    if isinstance(author_data, str):
+                        authors = [author_data]
+                    elif isinstance(author_data, list):
+                        authors = [a.get('name', a) if isinstance(a, dict) else a for a in author_data]
+                    else:
+                        authors = []
+                    
+                    # Publisher info
+                    publisher = item.get('publisher', '')
+                    if isinstance(publisher, list):
+                        publisher = publisher[0] if publisher else ''
+                    
+                    # Date/year
+                    date_str = item.get('date', item.get('publicationDate', ''))
+                    year_match = re.search(r'\d{4}', str(date_str))
+                    year = year_match.group(0) if year_match else ''
+                    
+                    # Place
+                    place = item.get('place', '')
+                    if isinstance(place, list):
+                        place = place[0] if place else ''
+                    if not place:
+                        place = resolve_place(publisher, '')
+                    
+                    if title:
+                        candidates.append({
+                            'type': 'book',
+                            'authors': authors,
+                            'title': title,
+                            'publisher': publisher,
+                            'place': place,
+                            'year': year,
+                            'source_engine': 'WorldCat',
+                            'raw_source': query
+                        })
+            else:
+                print(f"[WorldCat] HTTP {response.status_code} for query: {query[:30]}...")
+                
+        except Exception as e:
+            print(f"[WorldCat] Error: {e}")
+        
+        return candidates
+
+
+# ==================== ENGINE 5: INTERNET ARCHIVE ====================
+class InternetArchiveAPI:
+    """
+    Search Internet Archive's Open Library and book collections.
+    Best for: Historical books, out-of-print titles, scanned books.
+    No API key required.
+    
+    Added: 2025-12-05
+    """
+    SEARCH_URL = "https://archive.org/advancedsearch.php"
+    
+    @staticmethod
+    def search(query):
+        """Search Internet Archive by keyword."""
+        if not query:
+            return []
+        
+        candidates = []
+        try:
+            params = {
+                'q': f'title:({query}) AND mediatype:texts',
+                'fl[]': ['title', 'creator', 'publisher', 'date', 'year'],
+                'sort[]': 'downloads desc',
+                'rows': 3,
+                'page': 1,
+                'output': 'json'
+            }
+            
+            response = requests.get(InternetArchiveAPI.SEARCH_URL, params=params, timeout=8)
+            
+            if response.status_code == 200:
+                data = response.json()
+                docs = data.get('response', {}).get('docs', [])
+                
+                for doc in docs[:3]:
+                    title = doc.get('title', '')
+                    if isinstance(title, list):
+                        title = title[0] if title else ''
+                    
+                    # Creator/author
+                    creator = doc.get('creator', [])
+                    if isinstance(creator, str):
+                        authors = [creator]
+                    elif isinstance(creator, list):
+                        authors = creator[:3]  # Max 3 authors
+                    else:
+                        authors = []
+                    
+                    # Publisher
+                    publisher = doc.get('publisher', '')
+                    if isinstance(publisher, list):
+                        publisher = publisher[0] if publisher else ''
+                    
+                    # Year
+                    year = doc.get('year', doc.get('date', ''))
+                    if isinstance(year, list):
+                        year = year[0] if year else ''
+                    year_match = re.search(r'\d{4}', str(year))
+                    year = year_match.group(0) if year_match else ''
+                    
+                    # Place from publisher
+                    place = resolve_place(publisher, '')
+                    
+                    if title:
+                        candidates.append({
+                            'type': 'book',
+                            'authors': authors,
+                            'title': title,
+                            'publisher': publisher,
+                            'place': place,
+                            'year': year,
+                            'source_engine': 'Internet Archive',
+                            'raw_source': query
+                        })
+            else:
+                print(f"[InternetArchive] HTTP {response.status_code} for query: {query[:30]}...")
+                
+        except Exception as e:
+            print(f"[InternetArchive] Error: {e}")
+        
+        return candidates
+
 
 # ==================== MAIN CONTROLLER ====================
 
 def extract_metadata(text):
+    """
+    Extract book metadata using multiple engines in fallback order.
+    Returns first successful result.
+    """
     clean_text = text.strip()
     
     # STRATEGY 1: ISBN DETECTION
@@ -221,7 +550,84 @@ def extract_metadata(text):
         if results:
             return results
 
-    # STRATEGY 2: FUZZY TEXT SEARCH
-    # If no ISBN, or Open Library failed, use Google Books (Original Logic)
-    # This handles "Bowling Alone Putnam" much better than Open Library
-    return GoogleBooksAPI.search(clean_text)
+    # STRATEGY 2: GOOGLE BOOKS FUZZY SEARCH
+    results = GoogleBooksAPI.search(clean_text)
+    if results:
+        return results
+    
+    # STRATEGY 3: LIBRARY OF CONGRESS (no API key needed)
+    print(f"[books] Google Books returned nothing, trying Library of Congress...")
+    results = LibraryOfCongressAPI.search(clean_text)
+    if results:
+        return results
+    
+    # STRATEGY 4: WORLDCAT (if API key configured)
+    if WORLDCAT_API_KEY:
+        print(f"[books] LOC returned nothing, trying WorldCat...")
+        results = WorldCatAPI.search(clean_text)
+        if results:
+            return results
+    
+    # STRATEGY 5: OPEN LIBRARY SEARCH (final fallback)
+    print(f"[books] Trying Open Library search as final fallback...")
+    return OpenLibraryAPI.search(clean_text)
+
+
+def search_all_engines(text):
+    """
+    Search ALL book engines and return combined results.
+    Used by multi-candidate UI to show options from different sources.
+    
+    Returns list of results from all engines (not deduplicated).
+    """
+    clean_text = text.strip()
+    all_results = []
+    
+    # Google Books
+    try:
+        print(f"[books] Searching Google Books for: {clean_text[:30]}...")
+        results = GoogleBooksAPI.search(clean_text)
+        print(f"[books] Google Books returned {len(results)} results")
+        all_results.extend(results[:2])
+    except Exception as e:
+        print(f"[books] Google Books error: {e}")
+    
+    # Library of Congress
+    try:
+        print(f"[books] Searching Library of Congress...")
+        results = LibraryOfCongressAPI.search(clean_text)
+        print(f"[books] LOC returned {len(results)} results")
+        all_results.extend(results[:2])
+    except Exception as e:
+        print(f"[books] LOC error: {e}")
+    
+    # Internet Archive (free, no key needed)
+    try:
+        print(f"[books] Searching Internet Archive...")
+        results = InternetArchiveAPI.search(clean_text)
+        print(f"[books] Internet Archive returned {len(results)} results")
+        all_results.extend(results[:2])
+    except Exception as e:
+        print(f"[books] Internet Archive error: {e}")
+    
+    # WorldCat (if configured)
+    if WORLDCAT_API_KEY:
+        try:
+            print(f"[books] Searching WorldCat...")
+            results = WorldCatAPI.search(clean_text)
+            print(f"[books] WorldCat returned {len(results)} results")
+            all_results.extend(results[:2])
+        except Exception as e:
+            print(f"[books] WorldCat error: {e}")
+    
+    # Open Library
+    try:
+        print(f"[books] Searching Open Library...")
+        results = OpenLibraryAPI.search(clean_text)
+        print(f"[books] Open Library returned {len(results)} results")
+        all_results.extend(results[:2])
+    except Exception as e:
+        print(f"[books] Open Library error: {e}")
+    
+    print(f"[books] Total results from all engines: {len(all_results)}")
+    return all_results
