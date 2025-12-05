@@ -58,6 +58,69 @@ MEDICAL_DOMAINS = ['pubmed', 'ncbi.nlm.nih.gov', 'nih.gov/health', 'medlineplus'
 _crossref = CrossrefEngine()
 _openalex = OpenAlexEngine()
 _semantic = SemanticScholarEngine()
+
+
+# =============================================================================
+# RESULTS CACHE (speeds up repeated queries)
+# =============================================================================
+
+import time
+import threading
+import hashlib
+
+class ResultsCache:
+    """
+    Thread-safe cache for citation search results.
+    Speeds up repeated queries significantly.
+    
+    Added: 2025-12-05 15:30
+    """
+    
+    TTL_SECONDS = 1800  # 30 minutes
+    MAX_SIZE = 200      # Maximum cached queries
+    
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+    
+    def _make_key(self, query: str, style: str) -> str:
+        """Create cache key from query + style."""
+        normalized = f"{query.lower().strip()}|{style}"
+        return hashlib.md5(normalized.encode()).hexdigest()[:16]
+    
+    def get(self, query: str, style: str):
+        """Get cached results if not expired."""
+        key = self._make_key(query, style)
+        with self._lock:
+            if key in self._cache:
+                results, timestamp = self._cache[key]
+                if time.time() - timestamp < self.TTL_SECONDS:
+                    print(f"[Cache] HIT for: {query[:30]}...")
+                    return results
+                else:
+                    del self._cache[key]  # Expired
+        return None
+    
+    def set(self, query: str, style: str, results):
+        """Cache results with timestamp."""
+        key = self._make_key(query, style)
+        with self._lock:
+            # Evict oldest if at capacity
+            if len(self._cache) >= self.MAX_SIZE:
+                oldest_key = min(self._cache.keys(), 
+                               key=lambda k: self._cache[k][1])
+                del self._cache[oldest_key]
+            
+            self._cache[key] = (results, time.time())
+            print(f"[Cache] STORED: {query[:30]}... ({len(self._cache)} cached)")
+    
+    def clear(self):
+        """Clear all cached results."""
+        with self._lock:
+            self._cache.clear()
+
+# Global cache instance
+_results_cache = ResultsCache()
 _pubmed = PubMedEngine()
 
 
@@ -419,6 +482,12 @@ def get_citation(
         Tuple of (CitationMetadata, formatted_citation_string)
         Both may be None if lookup fails.
     """
+    # Check cache first (use "single:" prefix to distinguish from multiple)
+    cache_key = f"single:{query}"
+    cached = _results_cache.get(cache_key, style)
+    if cached is not None:
+        return cached
+    
     metadata, detection = route_citation(query)
     
     if not metadata or not metadata.has_minimum_data():
@@ -427,6 +496,9 @@ def get_citation(
     
     formatter = get_formatter(style)
     formatted = formatter.format(metadata)
+    
+    # Cache the result
+    _results_cache.set(cache_key, style, (metadata, formatted))
     
     return metadata, formatted
 
@@ -447,6 +519,11 @@ def get_multiple_citations(
     Returns:
         List of (CitationMetadata, formatted_string, source_name) tuples
     """
+    # Check cache first (instant return if hit)
+    cached = _results_cache.get(query, style)
+    if cached is not None:
+        return cached[:limit]
+    
     results = []
     formatter = get_formatter(style)
     seen_titles = set()  # Deduplicate by title
@@ -524,6 +601,10 @@ def get_multiple_citations(
                     add_result(meta, source_name)
             except Exception as e:
                 continue
+    
+    # Cache results for future queries
+    if results:
+        _results_cache.set(query, style, results)
     
     return results[:limit]
 

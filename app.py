@@ -52,7 +52,7 @@ class SessionManager:
     3. Multi-worker: Each worker has its own sessions (use Redis for shared state)
     """
     
-    SESSION_EXPIRY_HOURS = 1
+    SESSION_EXPIRY_HOURS = 4  # Extended from 1 hour for longer editing sessions
     CLEANUP_INTERVAL_MINUTES = 15
     
     def __init__(self):
