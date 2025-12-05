@@ -605,7 +605,21 @@
                     throw new Error(data.error || 'Save failed');
                 }
             } catch (err) {
-                alert('Failed to save: ' + err.message);
+                // Handle session expiry gracefully
+                if (err.message.includes('Session') || err.message.includes('expired')) {
+                    const copyIt = confirm('Session expired. Copy citation to clipboard instead?');
+                    if (copyIt) {
+                        navigator.clipboard.writeText(newText);
+                        btn.innerHTML = `<i class="fas fa-copy"></i> Copied!`;
+                        setTimeout(() => {
+                            btn.innerHTML = originalHtml;
+                            btn.disabled = false;
+                        }, 1500);
+                        return;
+                    }
+                } else {
+                    alert('Failed to save: ' + err.message);
+                }
                 btn.innerHTML = originalHtml;
                 btn.disabled = false;
             }
