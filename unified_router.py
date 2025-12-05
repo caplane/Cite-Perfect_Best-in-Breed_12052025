@@ -8,15 +8,15 @@ Version History:
     2025-12-05 13:15 V1.1: Added Westlaw pattern, verified all medical .gov exclusions
 
 KEY IMPROVEMENTS OVER ORIGINAL router.py:
-1. Legal detection uses court.is_legal_citation() which checks FAMOUS_CASES cache
+1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
    during detection (not just regex patterns that miss bare case names)
-2. Legal extraction uses court.extract_metadata() for cache + CourtListener API
-3. Book search uses books.py's GoogleBooksAPI + OpenLibraryAPI with PUBLISHER_PLACE_MAP
+2. Legal extraction uses superlegal.extract_metadata() for cache + CourtListener API
+3. Book search uses engines/books.py's GoogleBooksAPI + OpenLibraryAPI with PUBLISHER_PLACE_MAP
 4. Academic search uses CiteFlex Pro's parallel engine execution
 5. Medical URL override prevents PubMed/NIH URLs from routing to government
 
 ARCHITECTURE:
-- Wrapper classes convert court.py/books.py dicts → CitationMetadata
+- Wrapper classes convert engines/superlegal.py and engines/books.py dicts → CitationMetadata
 - Parallel execution via ThreadPoolExecutor (12s timeout)
 - Routing priority: Legal → URL handling → Parallel search → Fallback
 """
@@ -36,8 +36,8 @@ from engines.academic import CrossrefEngine, OpenAlexEngine, SemanticScholarEngi
 from engines.doi import extract_doi_from_url, is_academic_publisher_url
 
 # Import Cite Fix Pro modules (at root level)
-import court
-import books
+from engines import superlegal
+from engines import books
 
 
 # =============================================================================
@@ -129,7 +129,7 @@ _pubmed = PubMedEngine()
 # =============================================================================
 
 def _legal_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMetadata]:
-    """Convert court.py extract_metadata() dict to CitationMetadata."""
+    """Convert superlegal.py extract_metadata() dict to CitationMetadata."""
     if not data:
         return None
     
@@ -172,12 +172,12 @@ def _book_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMeta
 
 
 # =============================================================================
-# UNIFIED LEGAL SEARCH (uses court.py)
+# UNIFIED LEGAL SEARCH (uses superlegal.py)
 # =============================================================================
 
 def _route_legal(query: str) -> Optional[CitationMetadata]:
     """
-    Route legal case queries using Cite Fix Pro's court.py.
+    Route legal case queries using Cite Fix Pro's superlegal.py.
     
     This is superior to CiteFlex Pro's legal.py because:
     1. FAMOUS_CASES cache has 100+ landmark cases
@@ -186,7 +186,7 @@ def _route_legal(query: str) -> Optional[CitationMetadata]:
     4. CourtListener API fallback with phrase/keyword/fuzzy attempts
     """
     try:
-        data = court.extract_metadata(query)
+        data = superlegal.extract_metadata(query)
         if data and (data.get('case_name') or data.get('citation')):
             return _legal_dict_to_metadata(data, query)
     except Exception as e:
@@ -397,15 +397,15 @@ def route_citation(query: str) -> Tuple[Optional[CitationMetadata], DetectionRes
     Main routing function with unified detection and search.
     
     KEY DIFFERENCE from original router.py:
-    - Uses court.is_legal_citation() for legal detection (cache-aware)
+    - Uses superlegal.is_legal_citation() for legal detection (cache-aware)
     - This catches bare case names like "Roe v Wade" that regex misses
     """
     query = query.strip()
     
     # ==========================================================================
-    # STEP 1: Check if it's a legal citation using court.py's cache-aware detector
+    # STEP 1: Check if it's a legal citation using superlegal.py's cache-aware detector
     # ==========================================================================
-    if court.is_legal_citation(query):
+    if superlegal.is_legal_citation(query):
         print(f"[UnifiedRouter] Detected: LEGAL (cache-aware)")
         metadata = _route_legal(query)
         if metadata:
@@ -546,9 +546,13 @@ def get_multiple_citations(
     def add_result(meta, source_name, priority=False):
         """Add result if valid and not duplicate. Priority results go first."""
         if meta and meta.has_minimum_data():
-            title_key = (meta.title or '').lower()[:50]
-            if title_key and title_key not in seen_titles:
-                seen_titles.add(title_key)
+            # Use case_name for legal, title for everything else
+            if meta.citation_type == CitationType.LEGAL:
+                dedup_key = (meta.case_name or '').lower()[:50]
+            else:
+                dedup_key = (meta.title or '').lower()[:50]
+            if dedup_key and dedup_key not in seen_titles:
+                seen_titles.add(dedup_key)
                 formatted = formatter.format(meta)
                 if priority:
                     results.insert(0, (meta, formatted, source_name))
@@ -556,7 +560,7 @@ def get_multiple_citations(
                     results.append((meta, formatted, source_name))
     
     # 1. LEGAL CHECK FIRST - if it's a legal citation, return ONLY the legal result
-    if court.is_legal_citation(query):
+    if superlegal.is_legal_citation(query):
         print(f"[get_multiple] Detected legal citation: {query[:40]}...")
         metadata = _route_legal(query)
         if metadata:
@@ -676,8 +680,8 @@ def search_citation(query: str) -> List[dict]:
     results = []
     
     # Try legal first
-    if court.is_legal_citation(query):
-        data = court.extract_metadata(query)
+    if superlegal.is_legal_citation(query):
+        data = superlegal.extract_metadata(query)
         if data:
             results.append(data)
         return results
