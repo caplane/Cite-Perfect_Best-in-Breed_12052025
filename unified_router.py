@@ -10,6 +10,8 @@ Version History:
     2025-12-05 21:00 V2.1: Fixed get_multiple_citations to return 3-tuples
     2025-12-05 21:30 V2.2: Added URL/DOI handling to get_multiple_citations
     2025-12-05 22:30 V2.3: Added famous papers cache (10,000 most-cited papers)
+    2025-12-05 23:00 V2.4: Added Gemini AI fallback for UNKNOWN queries
+    2025-12-05 22:45 V2.4: Fixed UNKNOWN routing to search books first
 
 KEY IMPROVEMENTS OVER ORIGINAL router.py:
 1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
@@ -43,6 +45,14 @@ from engines.doi import extract_doi_from_url, is_academic_publisher_url
 from engines import superlegal
 from engines import books
 from engines.famous_papers import find_famous_paper
+
+# Gemini AI fallback for ambiguous queries
+try:
+    from gemini_router import classify_with_gemini
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("[UnifiedRouter] Gemini router not available - UNKNOWN queries will use default routing")
 
 
 # =============================================================================
@@ -413,7 +423,27 @@ def route_citation(query: str) -> Tuple[Optional[CitationMetadata], DetectionRes
         metadata = _route_url(query)
     
     elif detection.citation_type == CitationType.UNKNOWN:
-        # Try journal engines as default, then book
+        # Try Gemini AI to classify ambiguous queries
+        if GEMINI_AVAILABLE:
+            gemini_type, gemini_meta = classify_with_gemini(query)
+            if gemini_type != CitationType.UNKNOWN:
+                print(f"[UnifiedRouter] Gemini classified as: {gemini_type.name}")
+                
+                if gemini_type == CitationType.BOOK:
+                    metadata = _route_book(query)
+                elif gemini_type == CitationType.LEGAL:
+                    metadata = _route_legal(query)
+                elif gemini_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
+                    metadata = _route_journal(query)
+                elif gemini_type == CitationType.NEWSPAPER:
+                    metadata = extract_by_type(query, CitationType.NEWSPAPER)
+                elif gemini_type == CitationType.GOVERNMENT:
+                    metadata = extract_by_type(query, CitationType.GOVERNMENT)
+                
+                if metadata:
+                    return metadata, detection
+        
+        # Fallback: Try journal engines as default, then book
         metadata = _route_journal(query)
         if not metadata:
             metadata = _route_book(query)
@@ -568,27 +598,61 @@ def get_multiple_citations(
                 pass
     
     elif detection.citation_type == CitationType.UNKNOWN:
-        # For unknown, try BOTH Crossref AND book engines
-        # Crossref first (journals, chapters)
+        # Try Gemini AI to classify ambiguous queries
+        if GEMINI_AVAILABLE:
+            gemini_type, gemini_meta = classify_with_gemini(query)
+            if gemini_type != CitationType.UNKNOWN:
+                print(f"[UnifiedRouter] Gemini classified as: {gemini_type.name}")
+                
+                # Route based on Gemini's classification
+                if gemini_type == CitationType.BOOK:
+                    try:
+                        book_results = books.extract_metadata(query)
+                        for data in book_results[:limit]:
+                            meta = _book_dict_to_metadata(data, query)
+                            if meta:
+                                formatted = formatter.format(meta)
+                                source = data.get('source_engine', 'Google Books')
+                                results.append((meta, formatted, source))
+                    except Exception:
+                        pass
+                    return results[:limit]
+                
+                elif gemini_type == CitationType.LEGAL:
+                    metadata = _route_legal(query)
+                    if metadata:
+                        formatted = formatter.format(metadata)
+                        results.append((metadata, formatted, "Legal Cache"))
+                    return results
+                
+                elif gemini_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
+                    metadatas = _crossref.search_multiple(query, limit)
+                    for meta in metadatas:
+                        if meta and meta.has_minimum_data():
+                            formatted = formatter.format(meta)
+                            results.append((meta, formatted, "Crossref"))
+                    return results[:limit]
+        
+        # Fallback: try book engines FIRST (often what users want)
         try:
-            metadatas = _crossref.search_multiple(query, limit)
-            for meta in metadatas:
-                if meta and meta.has_minimum_data():
+            book_results = books.extract_metadata(query)
+            for data in book_results[:3]:  # Up to 3 book results
+                meta = _book_dict_to_metadata(data, query)
+                if meta:
                     formatted = formatter.format(meta)
-                    results.append((meta, formatted, "Crossref"))
+                    source = data.get('source_engine', 'Google Books')
+                    results.append((meta, formatted, source))
         except Exception:
             pass
         
-        # Then book engines
+        # Then fill remaining with Crossref (journals, chapters)
         if len(results) < limit:
             try:
-                book_results = books.extract_metadata(query)
-                for data in book_results[:limit - len(results)]:
-                    meta = _book_dict_to_metadata(data, query)
-                    if meta:
+                metadatas = _crossref.search_multiple(query, limit - len(results))
+                for meta in metadatas:
+                    if meta and meta.has_minimum_data():
                         formatted = formatter.format(meta)
-                        source = data.get('source_engine', 'Google Books')
-                        results.append((meta, formatted, source))
+                        results.append((meta, formatted, "Crossref"))
             except Exception:
                 pass
     
