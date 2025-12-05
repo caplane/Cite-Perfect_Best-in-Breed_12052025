@@ -6,6 +6,9 @@ Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 Version History:
     2025-12-05 13:15 V1.0: Initial unified router combining both systems
     2025-12-05 13:15 V1.1: Added Westlaw pattern, verified all medical .gov exclusions
+    2025-12-05 20:30 V2.0: Moved to engines/ architecture (superlegal, books)
+    2025-12-05 21:00 V2.1: Fixed get_multiple_citations to return 3-tuples
+    2025-12-05 21:30 V2.2: Added URL/DOI handling to get_multiple_citations
 
 KEY IMPROVEMENTS OVER ORIGINAL router.py:
 1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
@@ -62,7 +65,7 @@ _pubmed = PubMedEngine()
 
 
 # =============================================================================
-# WRAPPER: CONVERT COURT.PY DICT → CitationMetadata
+# WRAPPER: CONVERT SUPERLEGAL.PY DICT → CitationMetadata
 # =============================================================================
 
 def _legal_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMetadata]:
@@ -313,15 +316,25 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
                 print("[UnifiedRouter] Found via DOI extraction from URL")
                 return result
     
-    # 3. Government URL
+    # 3. Try generic DOI extraction from URL path
+    doi_match = re.search(r'(10\.\d{4,}/[^\s?#]+)', url)
+    if doi_match:
+        doi = doi_match.group(1).rstrip('.,;')
+        result = _crossref.get_by_id(doi)
+        if result:
+            result.url = url
+            print("[UnifiedRouter] Found via DOI in URL path")
+            return result
+    
+    # 4. Government URL
     if _is_government_url(url):
         return extract_by_type(url, CitationType.GOVERNMENT)
     
-    # 4. Newspaper URL
+    # 5. Newspaper URL
     if _is_newspaper_url(url):
         return extract_by_type(url, CitationType.NEWSPAPER)
     
-    # 5. Generic URL
+    # 6. Generic URL
     return extract_by_type(url, CitationType.URL)
 
 
@@ -450,9 +463,44 @@ def get_multiple_citations(
     results = []
     formatter = get_formatter(style)
     
-    # Check if legal first
+    # ==========================================================================
+    # STEP 0: URL with DOI - extract and lookup directly (MUST BE FIRST)
+    # ==========================================================================
+    if is_url(query):
+        # Try academic publisher URL first
+        if is_academic_publisher_url(query):
+            doi = extract_doi_from_url(query)
+            if doi:
+                result = _crossref.get_by_id(doi)
+                if result and result.has_minimum_data():
+                    result.url = query  # Preserve original URL
+                    formatted = formatter.format(result)
+                    results.append((result, formatted, "Crossref (DOI)"))
+                    return results  # DOI lookup is authoritative
+        
+        # Try extracting DOI from URL path (e.g., /doi/10.1086/737056)
+        doi_match = re.search(r'(10\.\d{4,}/[^\s?#]+)', query)
+        if doi_match:
+            doi = doi_match.group(1).rstrip('.,;')
+            result = _crossref.get_by_id(doi)
+            if result and result.has_minimum_data():
+                result.url = query
+                formatted = formatter.format(result)
+                results.append((result, formatted, "Crossref (DOI)"))
+                return results  # DOI lookup is authoritative
+        
+        # For non-DOI URLs, route through _route_url
+        metadata = _route_url(query)
+        if metadata and metadata.has_minimum_data():
+            formatted = formatter.format(metadata)
+            source = metadata.source_engine or "URL"
+            results.append((metadata, formatted, source))
+            return results
+    
+    # ==========================================================================
+    # STEP 1: Check if legal
+    # ==========================================================================
     if superlegal.is_legal_citation(query):
-        # Legal only returns one result from cache/API
         metadata = _route_legal(query)
         if metadata:
             formatted = formatter.format(metadata)
@@ -460,10 +508,12 @@ def get_multiple_citations(
             results.append((metadata, formatted, source))
         return results
     
-    # For other types, try to get multiple from Crossref
+    # ==========================================================================
+    # STEP 2: Detection-based routing
+    # ==========================================================================
     detection = detect_type(query)
     
-    if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL, CitationType.UNKNOWN]:
+    if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
         metadatas = _crossref.search_multiple(query, limit)
         for meta in metadatas:
             if meta and meta.has_minimum_data():
@@ -472,7 +522,7 @@ def get_multiple_citations(
                 results.append((meta, formatted, source))
     
     elif detection.citation_type == CitationType.BOOK:
-        # Books.py returns a list already
+        # Query book engines
         try:
             book_results = books.extract_metadata(query)
             for data in book_results[:limit]:
@@ -483,6 +533,42 @@ def get_multiple_citations(
                     results.append((meta, formatted, source))
         except Exception:
             pass
+        
+        # Also try Crossref (has book chapters)
+        if len(results) < limit:
+            try:
+                metadatas = _crossref.search_multiple(query, limit - len(results))
+                for meta in metadatas:
+                    if meta and meta.has_minimum_data():
+                        formatted = formatter.format(meta)
+                        results.append((meta, formatted, "Crossref"))
+            except Exception:
+                pass
+    
+    elif detection.citation_type == CitationType.UNKNOWN:
+        # For unknown, try BOTH Crossref AND book engines
+        # Crossref first (journals, chapters)
+        try:
+            metadatas = _crossref.search_multiple(query, limit)
+            for meta in metadatas:
+                if meta and meta.has_minimum_data():
+                    formatted = formatter.format(meta)
+                    results.append((meta, formatted, "Crossref"))
+        except Exception:
+            pass
+        
+        # Then book engines
+        if len(results) < limit:
+            try:
+                book_results = books.extract_metadata(query)
+                for data in book_results[:limit - len(results)]:
+                    meta = _book_dict_to_metadata(data, query)
+                    if meta:
+                        formatted = formatter.format(meta)
+                        source = data.get('source_engine', 'Google Books')
+                        results.append((meta, formatted, source))
+            except Exception:
+                pass
     
     return results[:limit]
 
