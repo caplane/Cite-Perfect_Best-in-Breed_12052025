@@ -484,9 +484,8 @@ def get_citation(
     """
     # Check cache first (use "single:" prefix to distinguish from multiple)
     cache_key = f"single:{query}"
-    cached = _results_cache.get(cache_key, style)
-    if cached is not None:
-        return cached
+    
+    cached = None  # _results_cache.get(cache_key, style)
     
     metadata, detection = route_citation(query)
     
@@ -535,7 +534,7 @@ def get_multiple_citations(
         List of (CitationMetadata, formatted_string, source_name) tuples
     """
     # Check cache first (instant return if hit)
-    cached = _results_cache.get(query, style)
+    cached = None  # _results_cache.get(query, style)
     if cached is not None:
         return cached[:limit]
     
