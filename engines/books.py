@@ -228,44 +228,69 @@ class GoogleBooksAPI:
         candidates = []
         try:
             cleaned_query = GoogleBooksAPI.clean_search_term(query)
-            params = {'q': cleaned_query, 'maxResults': 3, 'printType': 'books', 'orderBy': 'relevance'}
-            response = requests.get(GoogleBooksAPI.BASE_URL, params=params, timeout=5)
             
-            if response.status_code == 200:
-                items = response.json().get('items', [])
-                for item in items:
-                    info = item.get('volumeInfo', {})
-                    
-                    # Authors
-                    authors = info.get('authors', [])
-                    
-                    # Title
-                    title = info.get('title', '')
-                    if info.get('subtitle'):
-                        title = f"{title}: {info.get('subtitle')}"
-                    
-                    # Publisher
-                    publisher = info.get('publisher', '')
-                    
-                    # Date/Year
-                    date_str = info.get('publishedDate', '')
-                    year = date_str.split('-')[0] if date_str else ''
-                    
-                    # Place (Google Books rarely provides this, so we rely heavily on the Map)
-                    place = resolve_place(publisher, '')
+            # Try multiple query strategies
+            queries_to_try = [cleaned_query]
+            
+            # If query looks like "Author Title", try intitle: and inauthor:
+            words = cleaned_query.split()
+            if len(words) >= 3:
+                # Try: first word as author, rest as title
+                # e.g. "ilyon woo master slave" -> inauthor:ilyon+intitle:master slave
+                potential_author = words[0]
+                potential_title = ' '.join(words[1:])
+                queries_to_try.append(f'inauthor:{potential_author}+intitle:{potential_title}')
+                
+                # Try: first two words as author
+                # e.g. "ilyon woo master slave" -> inauthor:ilyon woo+intitle:master slave
+                if len(words) >= 4:
+                    potential_author = ' '.join(words[:2])
+                    potential_title = ' '.join(words[2:])
+                    queries_to_try.append(f'inauthor:{potential_author}+intitle:{potential_title}')
+            
+            for q in queries_to_try:
+                params = {'q': q, 'maxResults': 3, 'printType': 'books', 'orderBy': 'relevance'}
+                response = requests.get(GoogleBooksAPI.BASE_URL, params=params, timeout=5)
+                
+                if response.status_code == 200:
+                    items = response.json().get('items', [])
+                    for item in items:
+                        info = item.get('volumeInfo', {})
+                        
+                        # Authors
+                        authors = info.get('authors', [])
+                        
+                        # Title
+                        title = info.get('title', '')
+                        if info.get('subtitle'):
+                            title = f"{title}: {info.get('subtitle')}"
+                        
+                        # Publisher
+                        publisher = info.get('publisher', '')
+                        
+                        # Date/Year
+                        date_str = info.get('publishedDate', '')
+                        year = date_str.split('-')[0] if date_str else ''
+                        
+                        # Place (Google Books rarely provides this, so we rely heavily on the Map)
+                        place = resolve_place(publisher, '')
 
-                    candidates.append({
-                        'type': 'book',
-                        'authors': authors,
-                        'title': title,
-                        'publisher': publisher,
-                        'place': place,
-                        'year': year,
-                        'source_engine': 'Google Books',
-                        'raw_source': query
-                    })
-            else:
-                print(f"[GoogleBooks] HTTP {response.status_code} for query: {query[:30]}...")
+                        candidates.append({
+                            'type': 'book',
+                            'authors': authors,
+                            'title': title,
+                            'publisher': publisher,
+                            'place': place,
+                            'year': year,
+                            'source_engine': 'Google Books',
+                            'raw_source': query
+                        })
+                    
+                    # If we got results, stop trying other queries
+                    if candidates:
+                        break
+                else:
+                    print(f"[GoogleBooks] HTTP {response.status_code} for query: {q[:30]}...")
         except Exception as e:
             print(f"[GoogleBooks] Error: {e}")
         return candidates
