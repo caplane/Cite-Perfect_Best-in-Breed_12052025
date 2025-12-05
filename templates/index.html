@@ -434,36 +434,31 @@
             list.innerHTML = `
                 <div class="flex items-center justify-center py-10 gap-3 text-gray-400">
                     <div class="loader"></div>
-                    <span class="text-sm">Searching engines...</span>
+                    <span class="text-sm">Searching all engines...</span>
                 </div>
             `;
             
             try {
-                const res = await fetch('/api/cite', {
+                // Call /api/cite/multiple to get results from ALL engines
+                const res = await fetch('/api/cite/multiple', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ query: text, style: style })
+                    body: JSON.stringify({ query: text, style: style, limit: 6 })
                 });
                 const data = await res.json();
                 
-                if (data.success) {
-                    renderCandidates([{
-                        source: data.source || 'unified',
-                        type: data.type || 'unknown',
-                        formatted: data.citation,
-                        confidence: data.confidence || 'medium',
-                        metadata: data.metadata
-                    }]);
+                if (data.success && data.results && data.results.length > 0) {
+                    renderCandidates(data.results);
                     
-                    // Auto-fill the editor
-                    document.getElementById('final-edit-area').value = data.citation;
-                    
-                    // Update type badge
-                    if (data.type) {
+                    // Update type badge from first result
+                    const firstResult = data.results[0];
+                    if (firstResult.type) {
                         const typeBadge = document.getElementById('active-type');
-                        typeBadge.innerText = data.type;
-                        typeBadge.className = `text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-${data.type}`;
+                        typeBadge.innerText = firstResult.type;
+                        typeBadge.className = `text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-${firstResult.type}`;
                     }
+                    
+                    // Do NOT auto-fill editor - let user choose
                 } else {
                     list.innerHTML = `
                         <div class="text-center py-8 text-gray-400">
@@ -498,16 +493,19 @@
                 return;
             }
             
-            results.forEach(cand => {
+            results.forEach((cand, index) => {
                 const item = document.createElement('div');
                 item.className = 'bg-white p-4 rounded-xl border border-gray-200 hover:border-blue-400 hover:shadow-md cursor-pointer group transition-all';
                 
+                // Click to select this candidate and fill editor
                 item.onclick = () => {
-                    document.getElementById('final-edit-area').value = cand.formatted;
-                    item.classList.add('animate-pulse-once', 'border-blue-400', 'bg-blue-50');
-                    setTimeout(() => {
-                        item.classList.remove('animate-pulse-once', 'bg-blue-50');
-                    }, 500);
+                    document.getElementById('final-edit-area').value = cand.citation || cand.formatted;
+                    
+                    // Visual feedback - highlight selected
+                    document.querySelectorAll('#candidates-list > div').forEach(el => {
+                        el.classList.remove('border-blue-400', 'bg-blue-50', 'ring-2', 'ring-blue-200');
+                    });
+                    item.classList.add('border-blue-400', 'bg-blue-50', 'ring-2', 'ring-blue-200');
                 };
                 
                 const badgeClass = `badge-${cand.type || 'unknown'}`;
@@ -517,18 +515,20 @@
                     ? '<i class="fas fa-check-circle text-green-400 text-xs" title="Medium Confidence"></i>'
                     : '';
                 
+                const displayText = formatDisplayHtml(cand.citation || cand.formatted || '');
+                
                 item.innerHTML = `
                     <div class="flex justify-between items-start mb-2">
                         <div class="flex items-center gap-2">
                             <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded ${badgeClass}">${cand.type || 'result'}</span>
-                            <span class="text-[10px] text-gray-400">${cand.source}</span>
+                            <span class="text-[10px] text-gray-400 font-medium">${cand.source || 'engine'}</span>
                             ${confidenceIcon}
                         </div>
                         <button class="text-xs font-medium text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity bg-white px-2 py-1 rounded border border-blue-100 shadow-sm">
                             Use This <i class="fas fa-arrow-down ml-1"></i>
                         </button>
                     </div>
-                    <p class="text-sm serif text-gray-800 leading-relaxed">${formatDisplayHtml(cand.formatted)}</p>
+                    <p class="text-sm serif text-gray-800 leading-relaxed">${displayText}</p>
                 `;
                 list.appendChild(item);
             });
