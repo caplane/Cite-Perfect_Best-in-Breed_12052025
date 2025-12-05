@@ -9,6 +9,7 @@ Version History:
     2025-12-05 20:30 V2.0: Moved to engines/ architecture (superlegal, books)
     2025-12-05 21:00 V2.1: Fixed get_multiple_citations to return 3-tuples
     2025-12-05 21:30 V2.2: Added URL/DOI handling to get_multiple_citations
+    2025-12-05 22:30 V2.3: Added famous papers cache (10,000 most-cited papers)
 
 KEY IMPROVEMENTS OVER ORIGINAL router.py:
 1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
@@ -41,6 +42,7 @@ from engines.doi import extract_doi_from_url, is_academic_publisher_url
 # Import Cite Fix Pro modules (now in engines/)
 from engines import superlegal
 from engines import books
+from engines.famous_papers import find_famous_paper
 
 
 # =============================================================================
@@ -215,6 +217,14 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
     Route journal/article queries using CiteFlex Pro's academic engines.
     Runs Crossref, OpenAlex, and Semantic Scholar in parallel.
     """
+    # Check famous papers cache first (instant lookup for 10,000 most-cited)
+    famous = find_famous_paper(query)
+    if famous:
+        result = _crossref.get_by_id(famous["doi"])
+        if result:
+            print("[UnifiedRouter] Found via Famous Papers cache")
+            return result
+    
     # Check for DOI in query first (instant lookup)
     doi_match = re.search(r'(10\.\d{4,}/[^\s]+)', query)
     if doi_match:
@@ -496,6 +506,18 @@ def get_multiple_citations(
             source = metadata.source_engine or "URL"
             results.append((metadata, formatted, source))
             return results
+    
+    # ==========================================================================
+    # STEP 0.5: Check famous papers cache (10,000 most-cited papers)
+    # ==========================================================================
+    famous = find_famous_paper(query)
+    if famous:
+        # Use DOI to get full metadata from Crossref
+        result = _crossref.get_by_id(famous["doi"])
+        if result and result.has_minimum_data():
+            formatted = formatter.format(result)
+            results.append((result, formatted, "Famous Papers"))
+            return results  # Famous paper lookup is authoritative
     
     # ==========================================================================
     # STEP 1: Check if legal
