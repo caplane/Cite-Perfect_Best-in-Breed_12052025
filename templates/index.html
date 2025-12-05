@@ -391,7 +391,24 @@
             // Populate fields
             document.getElementById('active-id').innerText = `Note #${note.id}`;
             document.getElementById('active-original').innerText = note.text;
-            document.getElementById('final-edit-area').value = note.formatted || note.text;
+            
+            // Only auto-fill for rule-based forms (ibid/short)
+            // For new sources (full), leave empty so user must select from candidates
+            if (note.form === 'ibid' || note.form === 'short') {
+                document.getElementById('final-edit-area').value = note.formatted || '';
+                
+                // Mark as success in list since these are rule-based and already saved
+                if (note.success) {
+                    const listItem = document.getElementById(`list-item-${note.id}`);
+                    if (listItem && !listItem.classList.contains('status-success')) {
+                        listItem.classList.remove('status-pending', 'status-active');
+                        listItem.classList.add('status-success');
+                        listItem.querySelector('p').innerHTML = `<i class="fas fa-check text-green-500 mr-1"></i>${(note.formatted || '').substring(0, 70)}...`;
+                    }
+                }
+            } else {
+                document.getElementById('final-edit-area').value = '';
+            }
             
             // Update type badge
             const typeBadge = document.getElementById('active-type');
