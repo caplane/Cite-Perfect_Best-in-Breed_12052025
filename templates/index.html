@@ -541,18 +541,31 @@
 
         // ========== COMMIT CHANGES ==========
         async function commitChange() {
-            if (!activeNoteId || !sessionId) {
-                // For quick lookup, just copy to clipboard
-                copyToClipboard();
-                return;
-            }
-            
             const newText = document.getElementById('final-edit-area').value;
             const btn = document.getElementById('commit-btn');
             const originalHtml = btn.innerHTML;
             
+            if (!newText.trim()) {
+                alert('Please enter or select a citation first.');
+                return;
+            }
+            
+            // For quick lookup (no document), just copy to clipboard
+            if (!activeNoteId || !sessionId) {
+                await navigator.clipboard.writeText(newText);
+                btn.innerHTML = `<i class="fas fa-copy"></i> Copied!`;
+                setTimeout(() => { btn.innerHTML = originalHtml; }, 1500);
+                return;
+            }
+            
             btn.innerHTML = `<div class="loader w-5 h-5 border-white border-t-transparent"></div>`;
             btn.disabled = true;
+            
+            // Always update local state first (resilient to server issues)
+            const listItem = document.getElementById(`list-item-${activeNoteId}`);
+            if (currentCitations[activeNoteIndex]) {
+                currentCitations[activeNoteIndex].formatted = newText;
+            }
             
             try {
                 const res = await fetch('/api/update', {
@@ -567,62 +580,83 @@
                 const data = await res.json();
                 
                 if (data.success) {
-                    // Update list item
-                    const listItem = document.getElementById(`list-item-${activeNoteId}`);
-                    if (listItem) {
-                        listItem.classList.remove('status-pending', 'status-active');
-                        listItem.classList.add('status-success');
-                        listItem.querySelector('p').innerHTML = `<i class="fas fa-check text-green-500 mr-1"></i>${newText.substring(0, 70)}...`;
-                    }
-                    
-                    // Update success count
-                    successCount++;
-                    const countEl = document.getElementById('success-count');
-                    countEl.innerText = `${successCount} done`;
-                    countEl.classList.remove('hidden');
-                    
-                    // Update local data
-                    if (currentCitations[activeNoteIndex]) {
-                        currentCitations[activeNoteIndex].formatted = newText;
-                    }
-                    
-                    btn.innerHTML = `<i class="fas fa-check"></i> Saved!`;
-                    btn.classList.remove('from-blue-600', 'to-indigo-600');
-                    btn.classList.add('from-green-600', 'to-emerald-600');
-                    
-                    setTimeout(() => {
-                        btn.innerHTML = originalHtml;
-                        btn.classList.remove('from-green-600', 'to-emerald-600');
-                        btn.classList.add('from-blue-600', 'to-indigo-600');
-                        btn.disabled = false;
-                        
-                        // Auto-advance to next
-                        if (activeNoteIndex < currentCitations.length - 1) {
-                            navigateCitation(1);
-                        }
-                    }, 1000);
+                    markNoteSuccess(listItem, newText, btn, originalHtml);
                 } else {
                     throw new Error(data.error || 'Save failed');
                 }
             } catch (err) {
-                // Handle session expiry gracefully
-                if (err.message.includes('Session') || err.message.includes('expired')) {
-                    const copyIt = confirm('Session expired. Copy citation to clipboard instead?');
-                    if (copyIt) {
-                        navigator.clipboard.writeText(newText);
-                        btn.innerHTML = `<i class="fas fa-copy"></i> Copied!`;
-                        setTimeout(() => {
-                            btn.innerHTML = originalHtml;
-                            btn.disabled = false;
-                        }, 1500);
-                        return;
-                    }
-                } else {
-                    alert('Failed to save: ' + err.message);
+                console.warn('Server save failed:', err.message);
+                
+                // Session expired - copy to clipboard and mark locally anyway
+                await navigator.clipboard.writeText(newText);
+                
+                // Still mark as "done" locally so user can continue working
+                if (listItem) {
+                    listItem.classList.remove('status-pending', 'status-active');
+                    listItem.classList.add('status-success');
+                    listItem.querySelector('p').innerHTML = `<i class="fas fa-clipboard text-blue-500 mr-1"></i>${newText.substring(0, 70)}...`;
                 }
-                btn.innerHTML = originalHtml;
-                btn.disabled = false;
+                
+                successCount++;
+                const countEl = document.getElementById('success-count');
+                countEl.innerText = `${successCount} done`;
+                countEl.classList.remove('hidden');
+                
+                btn.innerHTML = `<i class="fas fa-clipboard"></i> Copied!`;
+                btn.classList.remove('from-blue-600', 'to-indigo-600');
+                btn.classList.add('from-yellow-500', 'to-amber-500');
+                
+                // Show brief warning
+                showToast('Session expired - citation copied to clipboard. Re-upload document to save to file.');
+                
+                setTimeout(() => {
+                    btn.innerHTML = originalHtml;
+                    btn.classList.remove('from-yellow-500', 'to-amber-500');
+                    btn.classList.add('from-blue-600', 'to-indigo-600');
+                    btn.disabled = false;
+                    
+                    if (activeNoteIndex < currentCitations.length - 1) {
+                        navigateCitation(1);
+                    }
+                }, 1500);
+                return;
             }
+        }
+        
+        function markNoteSuccess(listItem, newText, btn, originalHtml) {
+            if (listItem) {
+                listItem.classList.remove('status-pending', 'status-active');
+                listItem.classList.add('status-success');
+                listItem.querySelector('p').innerHTML = `<i class="fas fa-check text-green-500 mr-1"></i>${newText.substring(0, 70)}...`;
+            }
+            
+            successCount++;
+            const countEl = document.getElementById('success-count');
+            countEl.innerText = `${successCount} done`;
+            countEl.classList.remove('hidden');
+            
+            btn.innerHTML = `<i class="fas fa-check"></i> Saved!`;
+            btn.classList.remove('from-blue-600', 'to-indigo-600');
+            btn.classList.add('from-green-600', 'to-emerald-600');
+            
+            setTimeout(() => {
+                btn.innerHTML = originalHtml;
+                btn.classList.remove('from-green-600', 'to-emerald-600');
+                btn.classList.add('from-blue-600', 'to-indigo-600');
+                btn.disabled = false;
+                
+                if (activeNoteIndex < currentCitations.length - 1) {
+                    navigateCitation(1);
+                }
+            }, 1000);
+        }
+        
+        function showToast(message) {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-900 text-white px-4 py-2 rounded-lg shadow-lg text-sm z-50 animate-fade-in';
+            toast.innerText = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
         }
 
         // ========== UTILITIES ==========
@@ -647,7 +681,20 @@
         }
 
         async function downloadDocument() {
-            if (sessionId) {
+            if (!sessionId) {
+                showToast('No document loaded. Upload a document first.');
+                return;
+            }
+            
+            try {
+                const res = await fetch(`/api/download/${sessionId}`, { method: 'HEAD' });
+                if (res.ok) {
+                    window.location.href = `/api/download/${sessionId}`;
+                } else {
+                    showToast('Session expired. Please re-upload your document to download.');
+                }
+            } catch (err) {
+                // If HEAD fails, try direct download anyway
                 window.location.href = `/api/download/${sessionId}`;
             }
         }
