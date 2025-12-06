@@ -4,6 +4,10 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
+    2025-12-06 15:30 V3.5: Added interview and letter citation parsers.
+                           Interview triggers: "interview by", "interview with", "oral history"
+                           Letter trigger: "Person X to Person Y, Date" pattern
+                           Both types now bypass database search when parsed successfully.
     2025-12-06 13:45 V3.4: Added citation parser to extract metadata from already-formatted
                            citations. Reformats without database search when citation is complete.
                            Preserves authoritative content while applying consistent style.
@@ -195,17 +199,29 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
     Supports:
     - Chicago journal: Author, "Title," Journal Vol, no. Issue (Year): Pages. DOI
     - Chicago book: Author, Title (Place: Publisher, Year).
+    - Interview: Name, interview by author, Date.
+    - Letter: Person X to Person Y, Date.
     - APA patterns
     - Citations with DOIs/URLs
     
     Returns CitationMetadata if parsing succeeds, None otherwise.
     """
-    if not query or len(query) < 20:
+    if not query or len(query) < 15:
         return None
     
     query = query.strip()
     
-    # Try journal pattern first (most common in academic work)
+    # Try interview pattern first (has distinctive triggers)
+    meta = _parse_interview_citation(query)
+    if meta and _is_citation_complete(meta):
+        return meta
+    
+    # Try letter pattern (Person X to Person Y, Date)
+    meta = _parse_letter_citation(query)
+    if meta and _is_citation_complete(meta):
+        return meta
+    
+    # Try journal pattern (most common in academic work)
     meta = _parse_journal_citation(query)
     if meta and _is_citation_complete(meta):
         return meta
@@ -221,6 +237,200 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
         return meta
     
     return None
+
+
+def _parse_interview_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse interview citation.
+    
+    Triggers (high confidence):
+    - "interview by" 
+    - "interview with"
+    - "oral history"
+    - "interviewed by"
+    
+    Patterns:
+    - Name, interview by author, Date, Location.
+    - Name, interview with Author, Date.
+    - Name interview by Author, Date. Digitally recorded in author's possession.
+    """
+    query_lower = query.lower()
+    
+    # Check for interview triggers
+    triggers = ['interview by', 'interview with', 'oral history', 'interviewed by']
+    has_trigger = any(t in query_lower for t in triggers)
+    
+    if not has_trigger:
+        return None
+    
+    interviewee = ''
+    interviewer = ''
+    date = ''
+    location = ''
+    url = ''
+    
+    # Extract URL if present
+    url_match = re.search(r'https?://[^\s,]+', query)
+    if url_match:
+        url = url_match.group(0).rstrip('.,;')
+    
+    # Pattern: Interviewee, interview by Interviewer, Date
+    # Or: Interviewee interview by Interviewer, Date
+    interview_match = re.search(
+        r'^([^,]+?)(?:,\s*)?\binterview(?:ed)?\s+(?:by|with)\s+([^,]+)',
+        query, re.IGNORECASE
+    )
+    
+    if interview_match:
+        interviewee = interview_match.group(1).strip()
+        interviewer = interview_match.group(2).strip()
+        
+        # Get rest of string for date/location
+        rest = query[interview_match.end():].strip().lstrip(',').strip()
+        
+        # Extract date (various formats)
+        date_patterns = [
+            r'([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})',  # Jan. 15, 2022
+            r'(\d{1,2}\s+[A-Z][a-z]+\.?\s+\d{4})',     # 15 Jan 2022
+            r'([A-Z][a-z]+\s+\d{4})',                   # January 2022
+            r'(\d{4})',                                  # Just year
+        ]
+        
+        for pattern in date_patterns:
+            date_match = re.search(pattern, rest)
+            if date_match:
+                date = date_match.group(1)
+                break
+        
+        # Location might be city name before or after date
+        # Often: "Potomac, MD" or just location info
+        loc_match = re.search(r',\s*([A-Z][a-z]+(?:,\s*[A-Z]{2})?)\s*,', rest)
+        if loc_match:
+            location = loc_match.group(1)
+    
+    # Handle oral history pattern
+    elif 'oral history' in query_lower:
+        # Pattern: Name Oral History Interview, Source
+        oral_match = re.search(r'^([^,]+?)\s+oral\s+history', query, re.IGNORECASE)
+        if oral_match:
+            interviewee = oral_match.group(1).strip()
+    
+    if not interviewee:
+        return None
+    
+    # Extract year from date
+    year = ''
+    if date:
+        year_match = re.search(r'(\d{4})', date)
+        if year_match:
+            year = year_match.group(1)
+    
+    return CitationMetadata(
+        citation_type=CitationType.INTERVIEW,
+        raw_source=query,
+        source_engine="Parsed from formatted citation",
+        interviewee=interviewee,
+        interviewer=interviewer,
+        date=date,
+        year=year,
+        location=location,
+        url=url
+    )
+
+
+def _parse_letter_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse letter/correspondence citation.
+    
+    Trigger: "Person X to Person Y, Date" pattern
+    The date requirement prevents false positives like "Introduction to Psychology"
+    
+    Patterns:
+    - John Grad to Philip J. Hirschkop, Apr. 19, 1977.
+    - Aaron Fodiman to Henry Kissinger, Mar. 11, 1976.
+    - Name to Name, "Subject," Date, Collection.
+    """
+    # Pattern: Name to Name, followed by a date
+    # Must have date within reasonable distance to avoid "Introduction to X"
+    
+    # Look for "Name to Name" followed by comma and date-like content
+    # Names typically: First Last or First M. Last or First Middle Last
+    letter_pattern = re.compile(
+        r'^([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'  # Sender
+        r'\s+to\s+'
+        r'([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'  # Recipient
+        r',\s*'
+        r'(.+)$',  # Rest (should contain date)
+        re.MULTILINE
+    )
+    
+    match = letter_pattern.match(query)
+    if not match:
+        return None
+    
+    sender = match.group(1).strip()
+    recipient = match.group(2).strip()
+    rest = match.group(3).strip()
+    
+    # Must have a date within the rest to confirm this is a letter
+    date_patterns = [
+        r'([A-Z][a-z]{2,8}\.?\s+\d{1,2},?\s+\d{4})',  # Apr. 19, 1977 or April 19, 1977
+        r'(\d{1,2}\s+[A-Z][a-z]{2,8}\.?\s+\d{4})',     # 19 Apr 1977
+        r'([A-Z][a-z]{2,8}\.?\s+\d{4})',               # April 1977
+    ]
+    
+    date = ''
+    year = ''
+    for pattern in date_patterns:
+        date_match = re.search(pattern, rest)
+        if date_match:
+            date = date_match.group(1)
+            year_match = re.search(r'(\d{4})', date)
+            if year_match:
+                year = year_match.group(1)
+            break
+    
+    # If no date found, this might not be a letter (could be "Introduction to Psychology")
+    if not date:
+        return None
+    
+    # Extract URL if present
+    url = ''
+    url_match = re.search(r'https?://[^\s,]+', rest)
+    if url_match:
+        url = url_match.group(0).rstrip('.,;')
+    
+    # Extract subject/title if in quotes
+    title = ''
+    title_match = re.search(r'"([^"]+)"', rest)
+    if title_match:
+        title = title_match.group(1)
+    
+    # Extract location/collection info (often after date)
+    location = ''
+    # Look for collection info after date
+    if date:
+        after_date_idx = rest.find(date) + len(date)
+        after_date = rest[after_date_idx:].strip().lstrip(',').strip()
+        # Remove URL from consideration
+        if url:
+            after_date = after_date.replace(url, '').strip()
+        after_date = after_date.rstrip('.')
+        if after_date and not after_date.startswith('http'):
+            location = after_date
+    
+    return CitationMetadata(
+        citation_type=CitationType.LETTER,
+        raw_source=query,
+        source_engine="Parsed from formatted citation",
+        sender=sender,
+        recipient=recipient,
+        title=title,  # Subject line if present
+        date=date,
+        year=year,
+        location=location,  # Collection/archive info
+        url=url
+    )
 
 
 def _parse_journal_citation(query: str) -> Optional[CitationMetadata]:
@@ -575,11 +785,22 @@ def _is_citation_complete(meta: CitationMetadata) -> bool:
     - Journal: title + (journal OR year)
     - Book: title + (publisher OR year)  
     - Newspaper: title + (newspaper OR date OR url)
+    - Interview: interviewee + (date OR interviewer)
+    - Letter: sender + recipient + date
     - Legal: handled separately (not parsed here)
     """
     if not meta:
         return False
     
+    if meta.citation_type == CitationType.INTERVIEW:
+        # Need interviewee plus date or interviewer
+        return bool(meta.interviewee and (meta.date or meta.interviewer))
+    
+    elif meta.citation_type == CitationType.LETTER:
+        # Need sender, recipient, and date
+        return bool(meta.sender and meta.recipient and meta.date)
+    
+    # For other types, title is required
     if not meta.title:
         return False
     

@@ -16,6 +16,7 @@ class CitationType(Enum):
     BOOK = auto()
     LEGAL = auto()
     INTERVIEW = auto()
+    LETTER = auto()  # Correspondence: Person X to Person Y
     NEWSPAPER = auto()
     GOVERNMENT = auto()
     MEDICAL = auto()
@@ -144,6 +145,11 @@ class CitationMetadata:
     location: str = ""
     date: str = ""
     
+    # Letter/correspondence fields
+    sender: str = ""
+    recipient: str = ""
+    # (also uses: date, location, url, title for subject/re line)
+    
     # Newspaper fields
     newspaper: str = ""
     # (uses: author, title, date, url)
@@ -178,6 +184,8 @@ class CitationMetadata:
             return bool(self.case_name)
         elif self.citation_type == CitationType.INTERVIEW:
             return bool(self.interviewee or self.interviewer)
+        elif self.citation_type == CitationType.LETTER:
+            return bool(self.sender or self.recipient)
         elif self.citation_type == CitationType.NEWSPAPER:
             return bool(self.title or self.url)
         elif self.citation_type == CitationType.GOVERNMENT:
@@ -214,6 +222,8 @@ class CitationMetadata:
             'interviewer': self.interviewer,
             'location': self.location,
             'date': self.date,
+            'sender': self.sender,
+            'recipient': self.recipient,
             'newspaper': self.newspaper,
             'agency': self.agency,
             'document_number': self.document_number,
@@ -230,6 +240,7 @@ class CitationMetadata:
             'book': CitationType.BOOK,
             'legal': CitationType.LEGAL,
             'interview': CitationType.INTERVIEW,
+            'letter': CitationType.LETTER,
             'newspaper': CitationType.NEWSPAPER,
             'government': CitationType.GOVERNMENT,
             'medical': CitationType.MEDICAL,
@@ -263,6 +274,8 @@ class CitationMetadata:
             interviewer=d.get('interviewer', ''),
             location=d.get('location', ''),
             date=d.get('date', ''),
+            sender=d.get('sender', ''),
+            recipient=d.get('recipient', ''),
             newspaper=d.get('newspaper', ''),
             agency=d.get('agency', d.get('author', '')),  # Gov docs use 'author' for agency
             document_number=d.get('document_number', ''),
