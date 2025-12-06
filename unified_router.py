@@ -674,6 +674,12 @@ def get_citation_options_formatted(query: str, style: str = "chicago", limit: in
 # BACKWARD COMPATIBILITY
 # =============================================================================
 
+# Alias for app.py compatibility
+def get_citation(query: str, style: str = "chicago") -> Tuple[Optional[CitationMetadata], str]:
+    """Alias for route_citation() - backward compatibility."""
+    return route_citation(query, style)
+
+
 def search_citation(query: str) -> List[dict]:
     """
     Backward-compatible search function.
