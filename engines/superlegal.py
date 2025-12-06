@@ -4,6 +4,10 @@ citeflex/engines/superlegal.py
 Unified Legal Citation Engine - Merged from court.py + legal.py
 
 Version History:
+    2025-12-06 16:30: Fixed CourtListener search to use extracted case name.
+                      Previously, full citation text was passed to API, causing
+                      garbage results. Now extracts "Osheroff v. Chestnut Lodge"
+                      from full citation before API call.
     2025-12-06 16:00: Added _extract_case_name() to fix cache lookup bug.
                       Now extracts "Loving v Virginia" from "Loving v. Virginia, 388 U.S. 1 (1967)"
                       before cache lookup, ensuring famous cases are found even when
@@ -644,8 +648,11 @@ class LegalSearchEngine(SearchEngine):
         if result:
             return result
         
-        # 3. CourtListener search
-        return self.court_listener.search(query)
+        # 3. CourtListener search - extract case name first to avoid garbage results
+        # e.g., "Osheroff v. Chestnut Lodge, Maryland Health Claims Arbitration, Testimony..."
+        # should search for "Osheroff v. Chestnut Lodge", not the full string
+        case_name = _extract_case_name(query)
+        return self.court_listener.search(case_name)
     
     def search_multiple(self, query: str, limit: int = 5) -> List[CitationMetadata]:
         """Search for multiple legal case results."""
@@ -677,7 +684,9 @@ class LegalSearchEngine(SearchEngine):
         # 3. CourtListener (if we still need more results)
         if len(results) < limit:
             remaining = limit - len(results)
-            cl_results = self.court_listener.search_multiple(query, limit=remaining)
+            # Extract case name to avoid garbage results
+            case_name = _extract_case_name(query)
+            cl_results = self.court_listener.search_multiple(case_name, limit=remaining)
             for r in cl_results:
                 if add_result(r):
                     return results
