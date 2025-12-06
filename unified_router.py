@@ -4,6 +4,9 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
+    2025-12-06 13:45 V3.4: Added citation parser to extract metadata from already-formatted
+                           citations. Reformats without database search when citation is complete.
+                           Preserves authoritative content while applying consistent style.
     2025-12-06 12:25 V3.3: Added resolve_place fallback in _book_dict_to_metadata
                            to ensure publisher places appear even when APIs omit them
     2025-12-06 12:15 V3.2: Added Google Books, Open Library, Library of Congress to
@@ -176,6 +179,423 @@ def _book_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMeta
         isbn=data.get('isbn', ''),
         raw_data=data
     )
+
+
+# =============================================================================
+# CITATION PARSER: Extract metadata from already-formatted citations
+# =============================================================================
+
+def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse an already-formatted citation to extract metadata.
+    
+    This allows CiteFlex to reformat citations without searching databases,
+    preserving the user's authoritative content while applying style rules.
+    
+    Supports:
+    - Chicago journal: Author, "Title," Journal Vol, no. Issue (Year): Pages. DOI
+    - Chicago book: Author, Title (Place: Publisher, Year).
+    - APA patterns
+    - Citations with DOIs/URLs
+    
+    Returns CitationMetadata if parsing succeeds, None otherwise.
+    """
+    if not query or len(query) < 20:
+        return None
+    
+    query = query.strip()
+    
+    # Try journal pattern first (most common in academic work)
+    meta = _parse_journal_citation(query)
+    if meta and _is_citation_complete(meta):
+        return meta
+    
+    # Try book pattern
+    meta = _parse_book_citation(query)
+    if meta and _is_citation_complete(meta):
+        return meta
+    
+    # Try newspaper pattern
+    meta = _parse_newspaper_citation(query)
+    if meta and _is_citation_complete(meta):
+        return meta
+    
+    return None
+
+
+def _parse_journal_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse Chicago/academic journal citation.
+    
+    Patterns recognized:
+    - Author, "Title," Journal Vol, no. Issue (Year): Pages. DOI
+    - Author, "Title," Journal Vol (Year): Pages.
+    - Author "Title," Journal Vol, no. Issue (Year): Pages DOI
+    """
+    # Extract DOI if present (do this first, then remove from parsing)
+    doi = None
+    doi_match = re.search(r'(?:https?://)?(?:dx\.)?doi\.org/([^\s,\.]+[^\s,\.\)])', query)
+    if doi_match:
+        doi = doi_match.group(1).rstrip('.')
+    
+    # Extract URL if present (and no DOI)
+    url = None
+    if not doi:
+        url_match = re.search(r'https?://[^\s,]+', query)
+        if url_match:
+            url = url_match.group(0).rstrip('.,;')
+    
+    # Pattern: Author(s), "Title," Journal Volume, no. Issue (Year): Pages
+    # Also handles: Author(s) "Title," (without comma after author)
+    
+    # Look for quoted title (strong indicator of journal/article)
+    title_match = re.search(r'[,\s]"([^"]+)"[,\.]?\s*', query)
+    if not title_match:
+        # Try single quotes
+        title_match = re.search(r"[,\s]'([^']+)'[,\.]?\s*", query)
+    
+    if not title_match:
+        return None
+    
+    title = title_match.group(1).strip()
+    before_title = query[:title_match.start()].strip().rstrip(',')
+    after_title = query[title_match.end():].strip()
+    
+    # Parse authors (everything before the title)
+    authors = _parse_authors(before_title)
+    
+    # Parse journal info from after title
+    # Pattern: Journal Vol, no. Issue (Year): Pages
+    # Or: Journal Vol (Year): Pages
+    # Or: Journal Volume, no. Issue (Year) : Pages
+    
+    journal = None
+    volume = None
+    issue = None
+    year = None
+    pages = None
+    
+    # Extract year from parentheses
+    year_match = re.search(r'\((\d{4})\)', after_title)
+    if year_match:
+        year = year_match.group(1)
+    
+    # Extract pages (after colon or before DOI)
+    pages_match = re.search(r':\s*(\d+[-–]\d+|\d+)', after_title)
+    if pages_match:
+        pages = pages_match.group(1).replace('–', '-')
+    
+    # Extract volume and issue
+    # Pattern: Vol, no. Issue or Volume no. Issue or Vol(Issue)
+    vol_issue_match = re.search(r'(\d+)\s*,?\s*no\.?\s*(\d+)', after_title, re.IGNORECASE)
+    if vol_issue_match:
+        volume = vol_issue_match.group(1)
+        issue = vol_issue_match.group(2)
+    else:
+        # Just volume
+        vol_match = re.search(r'\b(\d+)\s*\(', after_title)
+        if vol_match:
+            volume = vol_match.group(1)
+    
+    # Extract journal name (text before volume/year, after title)
+    # Remove DOI/URL from consideration
+    journal_text = after_title
+    if doi_match:
+        journal_text = journal_text[:journal_text.find('doi.org') if 'doi.org' in journal_text.lower() else len(journal_text)]
+    if url:
+        journal_text = journal_text.replace(url, '')
+    
+    # Journal is typically italic in source, may have <i> tags
+    # Pattern: <i>Journal Name</i> or just Journal Name before volume
+    italic_match = re.search(r'<i>([^<]+)</i>', journal_text)
+    if italic_match:
+        journal = italic_match.group(1).strip()
+    else:
+        # Extract text before volume number
+        if volume:
+            vol_pos = journal_text.find(volume)
+            if vol_pos > 0:
+                journal = journal_text[:vol_pos].strip().rstrip(',').strip()
+        elif year_match:
+            year_pos = journal_text.find(f'({year})')
+            if year_pos > 0:
+                journal = journal_text[:year_pos].strip().rstrip(',').strip()
+    
+    # Clean up journal name
+    if journal:
+        journal = re.sub(r'^[,\s]+', '', journal)
+        journal = re.sub(r'[,\s]+$', '', journal)
+        # Remove any remaining HTML tags
+        journal = re.sub(r'<[^>]+>', '', journal)
+    
+    if not title or not year:
+        return None
+    
+    return CitationMetadata(
+        citation_type=CitationType.JOURNAL,
+        raw_source=query,
+        source_engine="Parsed from formatted citation",
+        title=title,
+        authors=authors if authors else [],
+        journal=journal or '',
+        volume=volume or '',
+        issue=issue or '',
+        year=year,
+        pages=pages or '',
+        doi=doi or '',
+        url=url or ''
+    )
+
+
+def _parse_book_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse Chicago book citation.
+    
+    Patterns recognized:
+    - Author, Title (Place: Publisher, Year).
+    - Author, Title (Publisher, Year).
+    - Author. Title. Place: Publisher, Year.
+    """
+    # Books have italic titles (not quoted)
+    # Look for (Place: Publisher, Year) or (Publisher, Year) pattern
+    
+    pub_match = re.search(r'\(([^)]+:\s*[^,)]+,\s*\d{4})\)', query)
+    if not pub_match:
+        # Try (Publisher, Year) without place
+        pub_match = re.search(r'\(([^):,]+,\s*\d{4})\)', query)
+    
+    if not pub_match:
+        return None
+    
+    pub_info = pub_match.group(1)
+    before_pub = query[:pub_match.start()].strip()
+    
+    # Parse publication info
+    place = ''
+    publisher = ''
+    year = ''
+    
+    # Extract year
+    year_match = re.search(r'(\d{4})', pub_info)
+    if year_match:
+        year = year_match.group(1)
+    
+    # Check for Place: Publisher pattern
+    if ':' in pub_info:
+        parts = pub_info.split(':')
+        place = parts[0].strip()
+        rest = ':'.join(parts[1:])
+        # Publisher is before the year
+        publisher = re.sub(r',?\s*\d{4}', '', rest).strip().rstrip(',')
+    else:
+        # Just Publisher, Year
+        publisher = re.sub(r',?\s*\d{4}', '', pub_info).strip().rstrip(',')
+    
+    # Parse author and title from before_pub
+    # Pattern: Author, Title or Author. Title.
+    
+    # Look for italic title marker
+    italic_match = re.search(r'<i>([^<]+)</i>', before_pub)
+    if italic_match:
+        title = italic_match.group(1).strip()
+        before_title = before_pub[:italic_match.start()].strip().rstrip(',').rstrip('.')
+        authors = _parse_authors(before_title)
+    else:
+        # No italic markers - try to split on comma after author name pattern
+        # Author names typically end before a capitalized title
+        # Heuristic: first comma after a name-like pattern
+        
+        # Simple split: everything before last comma-space before title
+        # For "John Smith, The Great Book" -> author="John Smith", title="The Great Book"
+        
+        # Try to find where title starts (usually capitalized, might have subtitle with colon)
+        parts = before_pub.split(', ')
+        if len(parts) >= 2:
+            # Assume first part(s) are author, last significant part is title
+            # Look for title-like part (longer, has capitalized words)
+            author_parts = []
+            title = ''
+            for i, part in enumerate(parts):
+                # If part looks like a title (longer, not a name pattern)
+                if len(part) > 30 or (i > 0 and ':' in part):
+                    title = ', '.join(parts[i:])
+                    break
+                author_parts.append(part)
+            
+            if not title and len(parts) >= 2:
+                author_parts = parts[:-1]
+                title = parts[-1]
+            
+            authors = _parse_authors(', '.join(author_parts))
+        else:
+            # Can't reliably split
+            authors = []
+            title = before_pub
+    
+    if not title or not year:
+        return None
+    
+    # Clean title
+    title = re.sub(r'<[^>]+>', '', title).strip()
+    
+    return CitationMetadata(
+        citation_type=CitationType.BOOK,
+        raw_source=query,
+        source_engine="Parsed from formatted citation",
+        title=title,
+        authors=authors if authors else [],
+        publisher=publisher,
+        place=place,
+        year=year
+    )
+
+
+def _parse_newspaper_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse newspaper article citation.
+    
+    Pattern: Author, "Title," Publication, Date, URL.
+    """
+    # Must have quoted title and a URL or date
+    title_match = re.search(r'"([^"]+)"', query)
+    if not title_match:
+        return None
+    
+    title = title_match.group(1)
+    before_title = query[:title_match.start()].strip().rstrip(',')
+    after_title = query[title_match.end():].strip().lstrip(',').strip()
+    
+    # Extract URL
+    url = None
+    url_match = re.search(r'https?://[^\s,]+', after_title)
+    if url_match:
+        url = url_match.group(0).rstrip('.,;')
+        after_title = after_title.replace(url, '').strip()
+    
+    # Parse authors
+    authors = _parse_authors(before_title)
+    
+    # After title: Publication, Date
+    # Look for italic publication name
+    pub_match = re.search(r'<i>([^<]+)</i>', after_title)
+    newspaper = ''
+    date = ''
+    
+    if pub_match:
+        newspaper = pub_match.group(1).strip()
+        rest = after_title[pub_match.end():].strip().lstrip(',').strip()
+        # Rest might be date
+        date_match = re.search(r'([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{4})', rest)
+        if date_match:
+            date = date_match.group(1)
+    else:
+        # Try to extract date and newspaper from remaining text
+        # Common patterns: New York Times, July 9, 2025
+        parts = [p.strip() for p in after_title.split(',')]
+        for i, part in enumerate(parts):
+            if re.search(r'\d{4}', part):
+                date = ', '.join(parts[i:]).strip().rstrip('.')
+                newspaper = ', '.join(parts[:i]).strip() if i > 0 else ''
+                break
+    
+    if not title:
+        return None
+    
+    # Extract year from date
+    year = ''
+    year_match = re.search(r'(\d{4})', date or '')
+    if year_match:
+        year = year_match.group(1)
+    
+    return CitationMetadata(
+        citation_type=CitationType.NEWSPAPER,
+        raw_source=query,
+        source_engine="Parsed from formatted citation",
+        title=title,
+        authors=authors if authors else [],
+        newspaper=newspaper,
+        date=date,
+        year=year,
+        url=url or ''
+    )
+
+
+def _parse_authors(author_str: str) -> list:
+    """
+    Parse author string into list of names.
+    
+    Handles:
+    - Single author: "John Smith"
+    - Two authors: "John Smith and Jane Doe"
+    - Multiple: "John Smith, Jane Doe, and Bob Wilson"
+    - Et al: "John Smith et al."
+    """
+    if not author_str:
+        return []
+    
+    author_str = author_str.strip()
+    
+    # Remove trailing punctuation
+    author_str = author_str.rstrip('.,;:')
+    
+    # Handle et al.
+    if 'et al' in author_str.lower():
+        # Just get first author
+        first = re.split(r'\s+et\s+al', author_str, flags=re.IGNORECASE)[0]
+        return [first.strip().rstrip(',')]
+    
+    # Split on " and " or ", and "
+    if ' and ' in author_str:
+        parts = re.split(r',?\s+and\s+', author_str)
+        authors = []
+        for part in parts:
+            # Further split on commas (for lists like "A, B, and C")
+            sub_parts = [p.strip() for p in part.split(',') if p.strip()]
+            authors.extend(sub_parts)
+        return authors
+    
+    # Check if comma-separated (multiple authors)
+    # But be careful: "Smith, John" is one author in Last, First format
+    parts = [p.strip() for p in author_str.split(',')]
+    if len(parts) == 2 and len(parts[1].split()) <= 2:
+        # Likely "Last, First" format - single author
+        return [author_str]
+    elif len(parts) > 2:
+        # Multiple authors
+        return parts
+    
+    return [author_str]
+
+
+def _is_citation_complete(meta: CitationMetadata) -> bool:
+    """
+    Check if parsed citation has enough data to skip database search.
+    
+    Criteria:
+    - Journal: title + (journal OR year)
+    - Book: title + (publisher OR year)  
+    - Newspaper: title + (newspaper OR date OR url)
+    - Legal: handled separately (not parsed here)
+    """
+    if not meta:
+        return False
+    
+    if not meta.title:
+        return False
+    
+    if meta.citation_type == CitationType.JOURNAL:
+        # Need title plus journal name or year
+        return bool(meta.journal or meta.year)
+    
+    elif meta.citation_type == CitationType.BOOK:
+        # Need title plus publisher or year
+        return bool(meta.publisher or meta.year)
+    
+    elif meta.citation_type == CitationType.NEWSPAPER:
+        # Need title plus newspaper name or date or URL
+        return bool(meta.newspaper or meta.date or meta.url)
+    
+    return False
 
 
 # =============================================================================
@@ -372,6 +792,11 @@ def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[Citatio
     Main entry point: route query to appropriate engine and format result.
     
     Returns: (CitationMetadata, formatted_citation_string)
+    
+    NEW (V3.4): Tries to parse already-formatted citations first.
+    If the citation is complete (has author, title, journal/publisher, year),
+    it reformats without searching databases. This preserves authoritative
+    content while applying consistent style formatting.
     """
     query = query.strip()
     if not query:
@@ -379,6 +804,13 @@ def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[Citatio
     
     formatter = get_formatter(style)
     metadata = None
+    
+    # 0. TRY PARSING FIRST: If citation is already complete, just reformat
+    # This preserves user's authoritative content while applying style
+    parsed = parse_existing_citation(query)
+    if parsed and _is_citation_complete(parsed):
+        print(f"[UnifiedRouter] Parsed complete citation: {parsed.citation_type.name}")
+        return parsed, formatter.format(parsed)
     
     # 1. Check for legal citation FIRST (superlegal.py handles famous cases)
     if superlegal.is_legal_citation(query):
@@ -464,6 +896,9 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
     Get multiple citation candidates for user selection.
     
     Returns list of (metadata, formatted_citation, source_name) tuples.
+    
+    NEW (V3.4): If citation is already complete, returns parsed version first
+    as "Original (Reformatted)" before database results.
     """
     query = query.strip()
     if not query:
@@ -471,6 +906,13 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
     
     formatter = get_formatter(style)
     results = []
+    
+    # TRY PARSING FIRST: If citation is complete, show reformatted version first
+    parsed = parse_existing_citation(query)
+    if parsed and _is_citation_complete(parsed):
+        formatted = formatter.format(parsed)
+        results.append((parsed, formatted, "Original (Reformatted)"))
+        print(f"[UnifiedRouter] Parsed complete citation, added as first option")
     
     # Detect type
     detection = detect_type(query)
