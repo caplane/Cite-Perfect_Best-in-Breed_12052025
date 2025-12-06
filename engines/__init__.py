@@ -11,7 +11,7 @@ from engines.academic import (
     SemanticScholarEngine,
     PubMedEngine,
 )
-from engines.legal import (
+from engines.superlegal import (
     FamousCasesCache,
     UKCitationParser,
     CourtListenerEngine,
