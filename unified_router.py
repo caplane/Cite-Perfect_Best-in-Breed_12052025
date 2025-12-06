@@ -4,6 +4,10 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
+    2025-12-06 11:50 V3.1: CRITICAL FIX - Changed search_by_doi to get_by_id,
+                           added famous papers cache to _route_journal,
+                           added fallback DOI regex extraction to _route_url
+    2025-12-06 V3.0: Switched to Claude API as primary AI router
     2025-12-05 13:15 V1.0: Initial unified router combining both systems
     2025-12-05 13:15 V1.1: Added Westlaw pattern, verified all medical .gov exclusions
     2025-12-05 20:30 V2.0: Moved to engines/ architecture (superlegal, books)
@@ -225,6 +229,30 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
     3. Semantic Scholar - good for author+title queries
     4. PubMed - medical/life sciences
     """
+    # Check famous papers cache first (instant lookup for 10,000 most-cited)
+    famous = find_famous_paper(query)
+    if famous:
+        try:
+            result = _crossref.get_by_id(famous["doi"])
+            if result:
+                print("[UnifiedRouter] Found via Famous Papers cache")
+                return result
+        except Exception:
+            pass
+    
+    # Check for DOI in query (instant lookup)
+    doi_match = re.search(r'(10\.\d{4,}/[^\s]+)', query)
+    if doi_match:
+        doi = doi_match.group(1).rstrip('.,;')
+        try:
+            result = _crossref.get_by_id(doi)
+            if result:
+                print("[UnifiedRouter] Found via direct DOI lookup")
+                return result
+        except Exception:
+            pass
+    
+    # Parallel search across academic engines
     results = []
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -281,9 +309,22 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
     doi = extract_doi_from_url(url)
     if doi:
         try:
-            result = _crossref.search_by_doi(doi)
+            result = _crossref.get_by_id(doi)
             if result and result.has_minimum_data():
                 result.url = url
+                return result
+        except Exception:
+            pass
+    
+    # Fallback: Try generic DOI extraction from URL path
+    doi_match = re.search(r'(10\.\d{4,}/[^\s?#]+)', url)
+    if doi_match:
+        doi = doi_match.group(1).rstrip('.,;')
+        try:
+            result = _crossref.get_by_id(doi)
+            if result and result.has_minimum_data():
+                result.url = url
+                print("[UnifiedRouter] Found via DOI in URL path")
                 return result
         except Exception:
             pass
@@ -429,7 +470,7 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
         doi = extract_doi_from_url(query)
         if doi:
             try:
-                result = _crossref.search_by_doi(doi)
+                result = _crossref.get_by_id(doi)
                 if result and result.has_minimum_data():
                     result.url = query
                     formatted = formatter.format(result)
