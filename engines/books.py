@@ -12,6 +12,8 @@ Engines (in priority order):
 6. Open Library Search - fallback
 
 Version History:
+    2025-12-06 11:55: Expanded PUBLISHER_PLACE_MAP to 300+ publishers with abbreviations
+                      (e.g., 'Univ of California Press', 'UC Press' → Berkeley)
     2025-12-05 12:53: Expanded PUBLISHER_PLACE_MAP with 40+ publishers including
                       Basic Books, Free Press, Johns Hopkins, Duke, and regional presses
     2025-12-05 13:15: Verified all publisher mappings work (17/17 tests pass)
