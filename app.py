@@ -4,6 +4,8 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
+    2025-12-06 13:00: CRITICAL FIX - Fixed /api/update and /api/download to properly
+                      access session data. Override feature now works correctly.
     2025-12-06 12:45: Added file-based session persistence to survive deployments
                       Sessions saved to /data/sessions (Railway Volume mount point)
     2025-12-05 12:53: Thread-safe session management with threading.Lock()
@@ -16,6 +18,8 @@ FIXES APPLIED:
 2. Session expiration (4 hours) to prevent memory leaks
 3. Periodic cleanup of expired sessions
 4. File-based persistence for sessions (survives deployments with Railway Volume)
+5. CRITICAL: /api/update now properly updates document (was silently failing)
+6. CRITICAL: /api/download now returns updated document (was returning original)
 """
 
 import os
@@ -510,20 +514,17 @@ def process_doc():
 def download(session_id: str):
     """Download processed document."""
     try:
-        doc_bytes = sessions.get(session_id)
+        # Get session data using proper method
+        session_data = sessions.get(session_id)
         
-        if not doc_bytes:
+        if not session_data:
             return jsonify({
                 'success': False,
                 'error': 'Session not found or expired'
             }), 404
         
-        processed_doc = sessions.get(session_id)
-        if not processed_doc or 'processed_doc' not in str(type(processed_doc)):
-            # Get the actual doc from session data
-            session_data = sessions._sessions.get(session_id, {}).get('data', {})
-            processed_doc = session_data.get('processed_doc')
-            filename = session_data.get('filename', 'processed.docx')
+        processed_doc = session_data.get('processed_doc')
+        filename = session_data.get('filename', 'processed.docx')
         
         if not processed_doc:
             return jsonify({
@@ -554,13 +555,20 @@ def download(session_id: str):
 def get_results(session_id: str):
     """Get processing results for a session."""
     try:
-        session_data = sessions._sessions.get(session_id, {}).get('data', {})
+        session_data = sessions.get(session_id)
+        
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
         results = session_data.get('results')
         
         if results is None:
             return jsonify({
                 'success': False,
-                'error': 'Session not found or expired'
+                'error': 'Results not found'
             }), 404
         
         return jsonify({
@@ -588,7 +596,7 @@ def update_note():
     }
     
     This re-processes the document with the updated note.
-    Added: 2025-12-05 13:35
+    Updated: 2025-12-06 13:00 - Fixed to properly update document and report failures
     """
     try:
         data = request.get_json()
@@ -609,16 +617,21 @@ def update_note():
                 'error': 'Missing session_id or note_id'
             }), 400
         
-        # Get session data
-        session_data = sessions._sessions.get(session_id, {}).get('data', {})
-        results = session_data.get('results', [])
-        original_bytes = session_data.get('original_bytes')
-        style = session_data.get('style', 'Chicago Manual of Style')
-        
-        if not results:
+        # Get session data using proper thread-safe method
+        session_data = sessions.get(session_id)
+        if not session_data:
             return jsonify({
                 'success': False,
                 'error': 'Session not found or expired'
+            }), 404
+        
+        results = session_data.get('results', [])
+        processed_doc = session_data.get('processed_doc')
+        
+        if not results or not processed_doc:
+            return jsonify({
+                'success': False,
+                'error': 'Session data incomplete'
             }), 404
         
         # Update the specific result
@@ -629,21 +642,31 @@ def update_note():
                 'error': f'Note {note_id} not found'
             }), 404
         
+        # Update the document - this is the critical part
+        from document_processor import update_document_note
+        try:
+            updated_doc = update_document_note(processed_doc, note_id, new_html)
+            
+            # Verify the update actually changed something
+            if updated_doc == processed_doc:
+                print(f"[API] Warning: update_document_note returned unchanged document for note {note_id}")
+            
+            # Save updated document to session
+            sessions.set(session_id, 'processed_doc', updated_doc)
+            
+        except Exception as update_err:
+            print(f"[API] Document update failed for note {note_id}: {update_err}")
+            return jsonify({
+                'success': False,
+                'error': f'Failed to update document: {str(update_err)}'
+            }), 500
+        
+        # Update results array
         results[note_idx]['formatted'] = new_html
         results[note_idx]['success'] = True
         sessions.set(session_id, 'results', results)
         
-        # Re-process document with updated notes
-        # For now, we'll update the processed doc with the manual overrides
-        if original_bytes:
-            from document_processor import update_document_note
-            try:
-                processed_doc = session_data.get('processed_doc')
-                updated_doc = update_document_note(processed_doc, note_id, new_html)
-                sessions.set(session_id, 'processed_doc', updated_doc)
-            except Exception as update_err:
-                print(f"[API] Note update warning: {update_err}")
-                # Continue even if document update fails - the results are saved
+        print(f"[API] Successfully updated note {note_id}")
         
         return jsonify({
             'success': True,
