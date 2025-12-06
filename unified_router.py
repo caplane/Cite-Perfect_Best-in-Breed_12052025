@@ -4,6 +4,10 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
+    2025-12-06 16:00 V3.6: Added legal citation parser to recognize already-formatted
+                           legal citations. Patterns: "Case v. Case, 388 U.S. 1 (1967)"
+                           and UK neutral citations "[2024] UKSC 1". Properly formatted
+                           legal citations now bypass superlegal.py database search.
     2025-12-06 15:30 V3.5: Added interview and letter citation parsers.
                            Interview triggers: "interview by", "interview with", "oral history"
                            Letter trigger: "Person X to Person Y, Date" pattern
@@ -197,6 +201,7 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
     preserving the user's authoritative content while applying style rules.
     
     Supports:
+    - Legal: Case Name, Volume Reporter Page (Court Year).
     - Chicago journal: Author, "Title," Journal Vol, no. Issue (Year): Pages. DOI
     - Chicago book: Author, Title (Place: Publisher, Year).
     - Interview: Name, interview by author, Date.
@@ -211,7 +216,12 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
     
     query = query.strip()
     
-    # Try interview pattern first (has distinctive triggers)
+    # Try legal citation first (has distinctive patterns)
+    meta = _parse_legal_citation(query)
+    if meta and (meta.case_name and meta.year):
+        return meta
+    
+    # Try interview pattern (has distinctive triggers)
     meta = _parse_interview_citation(query)
     if meta and _is_citation_complete(meta):
         return meta
@@ -235,6 +245,169 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
     meta = _parse_newspaper_citation(query)
     if meta and _is_citation_complete(meta):
         return meta
+    
+    return None
+
+
+def _parse_legal_citation(query: str) -> Optional[CitationMetadata]:
+    """
+    Parse already-formatted legal citation.
+    
+    Patterns recognized:
+    - US: Case Name, Volume Reporter Page (Court Year).
+      e.g., Loving v. Virginia, 388 U.S. 1 (1967).
+    - US Circuit: Case Name, Volume F.2d/F.3d Page (Circuit Year).
+      e.g., Johnson v. Branch, 364 F.2d 177 (4th Cir. 1966).
+    - US District: Case Name, Volume F. Supp. Page (District Year).
+      e.g., Landman v. Royster, 333 F. Supp. 621 (E.D. Va. 1971).
+    - UK: Case Name [Year] Court Number
+      e.g., R v Brown [1994] 1 AC 212
+    
+    Returns CitationMetadata if parsing succeeds, None otherwise.
+    """
+    if not query or len(query) < 10:
+        return None
+    
+    query = query.strip()
+    
+    # Must have "v." or "v " pattern (case name indicator)
+    if not re.search(r'\s+v\.?\s+', query, re.IGNORECASE):
+        # Also check for "In re" or "Ex parte" patterns
+        if not re.search(r'^(In\s+re|Ex\s+parte|Matter\s+of)\s+', query, re.IGNORECASE):
+            return None
+    
+    case_name = ''
+    citation = ''
+    court = ''
+    year = ''
+    
+    # =========================================================================
+    # Pattern 1: US Citations - Case Name, Citation (Court Year).
+    # =========================================================================
+    
+    # Match: Case Name, Volume Reporter Page (Court? Year)
+    # Examples:
+    #   Loving v. Virginia, 388 U.S. 1 (1967)
+    #   Johnson v. Branch, 364 F.2d 177 (4th Cir. 1966)
+    #   Landman v. Royster, 333 F. Supp. 621 (E.D. Va. 1971)
+    
+    us_pattern = re.compile(
+        r'^(.+?)\s*,\s*'                    # Case name (up to comma)
+        r'(\d+\s+'                           # Volume number
+        r'(?:U\.S\.|S\.\s*Ct\.|L\.\s*Ed\.|'  # Supreme Court reporters
+        r'F\.(?:\d[a-z]*d?\s*)?|'            # Federal Reporter (F., F.2d, F.3d, F. 4th)
+        r'F\.\s*Supp\.(?:\s*\d+[a-z]*)?|'   # F. Supp., F. Supp. 2d, F. Supp. 3d
+        r'[A-Z]\.\d*[a-z]*)'                 # State reporters (A.2d, N.E.2d, etc.)
+        r'\s*\d+)'                           # Page number
+        r'\s*\(([^)]+)\)'                    # Parenthetical (Court Year)
+    )
+    
+    match = us_pattern.match(query)
+    if match:
+        case_name = match.group(1).strip()
+        citation = match.group(2).strip()
+        paren_content = match.group(3).strip()
+        
+        # Parse parenthetical: could be just year "(1967)" or court + year "(4th Cir. 1966)"
+        year_match = re.search(r'(\d{4})', paren_content)
+        if year_match:
+            year = year_match.group(1)
+            court_part = paren_content[:year_match.start()].strip().rstrip(',')
+            if court_part:
+                court = court_part
+            else:
+                # Infer court from reporter
+                if 'U.S.' in citation:
+                    court = 'Supreme Court of the United States'
+                elif 'S. Ct.' in citation:
+                    court = 'Supreme Court of the United States'
+        
+        return CitationMetadata(
+            citation_type=CitationType.LEGAL,
+            raw_source=query,
+            source_engine="Parsed from formatted citation",
+            case_name=case_name,
+            citation=citation,
+            court=court,
+            year=year,
+            jurisdiction='US'
+        )
+    
+    # =========================================================================
+    # Pattern 2: UK Neutral Citations - Case Name [Year] Court Number
+    # =========================================================================
+    
+    uk_pattern = re.compile(
+        r'^(.+?)\s*'                         # Case name
+        r'\[(\d{4})\]\s*'                    # [Year]
+        r'(\w+(?:\s+\w+)?)\s*'               # Court code (UKSC, EWCA Civ, etc.)
+        r'(\d+)'                              # Case number
+    )
+    
+    match = uk_pattern.match(query)
+    if match:
+        case_name = match.group(1).strip().rstrip(',')
+        year = match.group(2)
+        court_code = match.group(3).strip()
+        case_number = match.group(4)
+        citation = f'[{year}] {court_code} {case_number}'
+        
+        # Map court codes
+        uk_courts = {
+            'UKSC': 'Supreme Court',
+            'UKHL': 'House of Lords',
+            'EWCA Civ': 'Court of Appeal (Civil)',
+            'EWCA Crim': 'Court of Appeal (Criminal)',
+            'EWHC': 'High Court',
+        }
+        court = uk_courts.get(court_code, court_code)
+        
+        return CitationMetadata(
+            citation_type=CitationType.LEGAL,
+            raw_source=query,
+            source_engine="Parsed from formatted citation",
+            case_name=case_name,
+            citation=citation,
+            court=court,
+            year=year,
+            jurisdiction='UK'
+        )
+    
+    # =========================================================================
+    # Pattern 3: Simpler fallback - just extract what we can
+    # =========================================================================
+    
+    # Try to extract case name before comma
+    parts = query.split(',', 1)
+    if len(parts) >= 1:
+        potential_name = parts[0].strip()
+        if re.search(r'\s+v\.?\s+', potential_name, re.IGNORECASE) or \
+           re.search(r'^(In\s+re|Ex\s+parte)', potential_name, re.IGNORECASE):
+            case_name = potential_name
+            
+            # Try to find year in rest
+            if len(parts) > 1:
+                rest = parts[1]
+                year_match = re.search(r'\((\d{4})\)', rest)
+                if year_match:
+                    year = year_match.group(1)
+                
+                # Try to extract citation (numbers + reporter)
+                cit_match = re.search(r'(\d+\s+[A-Z][A-Za-z\.\s]+\d+)', rest)
+                if cit_match:
+                    citation = cit_match.group(1).strip()
+            
+            if case_name and year:
+                return CitationMetadata(
+                    citation_type=CitationType.LEGAL,
+                    raw_source=query,
+                    source_engine="Parsed from formatted citation",
+                    case_name=case_name,
+                    citation=citation,
+                    court=court,
+                    year=year,
+                    jurisdiction='US'
+                )
     
     return None
 
