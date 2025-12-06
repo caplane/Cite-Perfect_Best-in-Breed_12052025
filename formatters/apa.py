@@ -29,6 +29,8 @@ class APAFormatter(BaseFormatter):
             return self._format_legal(metadata)
         elif metadata.citation_type == CitationType.INTERVIEW:
             return self._format_interview(metadata)
+        elif metadata.citation_type == CitationType.LETTER:
+            return self._format_letter(metadata)
         elif metadata.citation_type == CitationType.NEWSPAPER:
             return self._format_newspaper(metadata)
         elif metadata.citation_type == CitationType.GOVERNMENT:
@@ -252,6 +254,52 @@ class APAFormatter(BaseFormatter):
         
         # Type of communication
         parts.append("[Personal interview].")
+        
+        result = " ".join(parts)
+        return self._ensure_period(result)
+    
+    # =========================================================================
+    # LETTER/CORRESPONDENCE
+    # =========================================================================
+    
+    def _format_letter(self, m: CitationMetadata) -> str:
+        """
+        APA letter (personal communication).
+        
+        Note: APA treats letters as personal communications, typically
+        cited in-text only. This provides a reference-style format.
+        
+        Pattern: Sender, S. (Date). [Letter to Recipient]. Collection.
+        """
+        parts = []
+        
+        # Sender as author
+        if m.sender:
+            parts.append(self._format_authors_apa([m.sender]))
+        
+        # Date
+        if m.date:
+            parts.append(f"({m.date}).")
+        elif m.year:
+            parts.append(f"({m.year}).")
+        
+        # Description with recipient
+        if m.recipient:
+            parts.append(f"[Letter to {m.recipient}].")
+        else:
+            parts.append("[Personal correspondence].")
+        
+        # Subject if present
+        if m.title:
+            parts.append(f'"{m.title}."')
+        
+        # Collection/location
+        if m.location:
+            parts.append(m.location + ".")
+        
+        # URL
+        if m.url:
+            parts.append(m.url)
         
         result = " ".join(parts)
         return self._ensure_period(result)
