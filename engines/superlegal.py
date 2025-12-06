@@ -4,6 +4,10 @@ citeflex/engines/superlegal.py
 Unified Legal Citation Engine - Merged from court.py + legal.py
 
 Version History:
+    2025-12-06 16:00: Added _extract_case_name() to fix cache lookup bug.
+                      Now extracts "Loving v Virginia" from "Loving v. Virginia, 388 U.S. 1 (1967)"
+                      before cache lookup, ensuring famous cases are found even when
+                      properly formatted with full citations.
     2025-12-05 20:00: Created by merging court.py (V28.1) and legal.py
                       - Base: legal.py SearchEngine architecture
                       - Added: 25+ cases from court.py (state courts, federal circuit, tech)
@@ -178,11 +182,65 @@ def _normalize_key(text: str) -> str:
     return " ".join(text.split())
 
 
+def _extract_case_name(text: str) -> str:
+    """
+    Extract just the case name (X v. Y, In re X, etc.) from a full citation.
+    
+    This prevents cache lookup from failing when input includes citation details
+    like "Loving v. Virginia, 388 U.S. 1 (1967)" - we extract just "Loving v. Virginia".
+    
+    Added: 2025-12-06 to fix cache miss bug for properly formatted legal citations.
+    """
+    if not text:
+        return text
+    
+    # Pattern 1: X v. Y, X v Y, X vs Y, X versus Y
+    # Capture everything up to comma, digit, or parenthesis
+    match = re.search(
+        r"([A-Z][A-Za-z\.\'\-\&\s]+?)\s+(?:v\.?|vs\.?|versus)\s+([A-Z][A-Za-z\.\'\-\&\s]+?)(?=,|\s+\d|\s*\(|$)",
+        text
+    )
+    if match:
+        return f"{match.group(1).strip()} v {match.group(2).strip()}"
+    
+    # Pattern 2: In re X
+    match = re.search(
+        r"(In\s+re\s+[A-Z][A-Za-z\.\'\-\&\s]+?)(?=,|\s+\d|\s*\(|$)",
+        text, re.IGNORECASE
+    )
+    if match:
+        return match.group(1).strip()
+    
+    # Pattern 3: Ex parte X
+    match = re.search(
+        r"(Ex\s+parte\s+[A-Z][A-Za-z\.\'\-\&\s]+?)(?=,|\s+\d|\s*\(|$)",
+        text, re.IGNORECASE
+    )
+    if match:
+        return match.group(1).strip()
+    
+    # Pattern 4: Matter of X
+    match = re.search(
+        r"(Matter\s+of\s+[A-Z][A-Za-z\.\'\-\&\s]+?)(?=,|\s+\d|\s*\(|$)",
+        text, re.IGNORECASE
+    )
+    if match:
+        return match.group(1).strip()
+    
+    return text  # Fallback to original
+
+
 def _find_best_cache_match(text: str) -> Optional[str]:
     """Find the best matching key in FAMOUS_CASES using fuzzy matching."""
-    clean_key = _normalize_key(text)
+    # First, extract just the case name (strips citation details like "388 U.S. 1 (1967)")
+    case_name = _extract_case_name(text)
+    clean_key = _normalize_key(case_name)
+    
+    # Exact match
     if clean_key in FAMOUS_CASES:
         return clean_key
+    
+    # Fuzzy match
     matches = difflib.get_close_matches(clean_key, FAMOUS_CASES.keys(), n=1, cutoff=0.7)
     if matches:
         return matches[0]
