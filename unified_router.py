@@ -4,6 +4,10 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
+    2025-12-06 12:25 V3.3: Added resolve_place fallback in _book_dict_to_metadata
+                           to ensure publisher places appear even when APIs omit them
+    2025-12-06 12:15 V3.2: Added Google Books, Open Library, Library of Congress to
+                           get_multiple_citations() UI options using books.search_all_engines()
     2025-12-06 11:50 V3.1: CRITICAL FIX - Changed search_by_doi to get_by_id,
                            added famous papers cache to _route_journal,
                            added fallback DOI regex extraction to _route_url
@@ -154,6 +158,12 @@ def _book_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMeta
     if not data:
         return None
     
+    # Get place, with fallback to publisher lookup if missing
+    place = data.get('place', '')
+    publisher = data.get('publisher', '')
+    if not place and publisher:
+        place = books.resolve_place(publisher, '')
+    
     return CitationMetadata(
         citation_type=CitationType.BOOK,
         raw_source=raw_source,
@@ -161,8 +171,8 @@ def _book_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMeta
         title=data.get('title', ''),
         authors=data.get('authors', []),
         year=data.get('year', ''),
-        publisher=data.get('publisher', ''),
-        place=data.get('place', ''),
+        publisher=publisher,
+        place=place,
         isbn=data.get('isbn', ''),
         raw_data=data
     )
@@ -525,19 +535,53 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
                         results.append((ss_result, formatted, "Semantic Scholar"))
             except Exception:
                 pass
+        
+        # Also search book engines (Google Books, Library of Congress, Open Library)
+        # Many queries could be books misclassified as journals
+        if len(results) < limit:
+            try:
+                book_results = books.search_all_engines(query)
+                for data in book_results:
+                    if len(results) >= limit:
+                        break
+                    meta = _book_dict_to_metadata(data, query)
+                    if meta and meta.has_minimum_data():
+                        # Check for duplicates
+                        is_duplicate = any(
+                            meta.title and r[0].title and 
+                            meta.title.lower()[:30] == r[0].title.lower()[:30]
+                            for r in results
+                        )
+                        if not is_duplicate:
+                            formatted = formatter.format(meta)
+                            source = data.get('source_engine', 'Google Books')
+                            results.append((meta, formatted, source))
+            except Exception as e:
+                print(f"[UnifiedRouter] Book engines error: {e}")
+            except Exception:
+                pass
     
     elif detection.citation_type == CitationType.BOOK:
-        # Query book engines
+        # Query ALL book engines (Google Books, Library of Congress, Open Library)
         try:
-            book_results = books.extract_metadata(query)
-            for data in book_results[:limit]:
+            book_results = books.search_all_engines(query)
+            for data in book_results:
+                if len(results) >= limit:
+                    break
                 meta = _book_dict_to_metadata(data, query)
-                if meta:
-                    formatted = formatter.format(meta)
-                    source = meta.source_engine or data.get('source_engine', 'Google Books')
-                    results.append((meta, formatted, source))
-        except Exception:
-            pass
+                if meta and meta.has_minimum_data():
+                    # Check for duplicates
+                    is_duplicate = any(
+                        meta.title and r[0].title and 
+                        meta.title.lower()[:30] == r[0].title.lower()[:30]
+                        for r in results
+                    )
+                    if not is_duplicate:
+                        formatted = formatter.format(meta)
+                        source = data.get('source_engine', 'Google Books')
+                        results.append((meta, formatted, source))
+        except Exception as e:
+            print(f"[UnifiedRouter] Book engines error: {e}")
         
         # Also try Crossref (has book chapters)
         if len(results) < limit:
@@ -576,15 +620,23 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
                 # Route based on AI's classification
                 if ai_type == CitationType.BOOK:
                     try:
-                        book_results = books.extract_metadata(query)
-                        for data in book_results[:limit]:
+                        book_results = books.search_all_engines(query)
+                        for data in book_results:
+                            if len(results) >= limit:
+                                break
                             meta = _book_dict_to_metadata(data, query)
-                            if meta:
-                                formatted = formatter.format(meta)
-                                source = data.get('source_engine', 'Google Books')
-                                results.append((meta, formatted, source))
-                    except Exception:
-                        pass
+                            if meta and meta.has_minimum_data():
+                                is_duplicate = any(
+                                    meta.title and r[0].title and 
+                                    meta.title.lower()[:30] == r[0].title.lower()[:30]
+                                    for r in results
+                                )
+                                if not is_duplicate:
+                                    formatted = formatter.format(meta)
+                                    source = data.get('source_engine', 'Google Books')
+                                    results.append((meta, formatted, source))
+                    except Exception as e:
+                        print(f"[UnifiedRouter] Book engines error: {e}")
                     # Also try Semantic Scholar
                     if len(results) < limit:
                         try:
@@ -630,19 +682,47 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
                                     results.append((ss_result, formatted, "Semantic Scholar"))
                         except Exception:
                             pass
+                    # Also try book engines (could be a book, not just journal)
+                    if len(results) < limit:
+                        try:
+                            book_results = books.search_all_engines(query)
+                            for data in book_results:
+                                if len(results) >= limit:
+                                    break
+                                meta = _book_dict_to_metadata(data, query)
+                                if meta and meta.has_minimum_data():
+                                    is_duplicate = any(
+                                        meta.title and r[0].title and 
+                                        meta.title.lower()[:30] == r[0].title.lower()[:30]
+                                        for r in results
+                                    )
+                                    if not is_duplicate:
+                                        formatted = formatter.format(meta)
+                                        source = data.get('source_engine', 'Google Books')
+                                        results.append((meta, formatted, source))
+                        except Exception:
+                            pass
                     return results[:limit]
         
-        # Fallback: try book engines FIRST (often what users want)
+        # Fallback: try ALL book engines (often what users want)
         try:
-            book_results = books.extract_metadata(query)
-            for data in book_results[:3]:
+            book_results = books.search_all_engines(query)
+            for data in book_results:
+                if len(results) >= limit:
+                    break
                 meta = _book_dict_to_metadata(data, query)
-                if meta:
-                    formatted = formatter.format(meta)
-                    source = data.get('source_engine', 'Google Books')
-                    results.append((meta, formatted, source))
-        except Exception:
-            pass
+                if meta and meta.has_minimum_data():
+                    is_duplicate = any(
+                        meta.title and r[0].title and 
+                        meta.title.lower()[:30] == r[0].title.lower()[:30]
+                        for r in results
+                    )
+                    if not is_duplicate:
+                        formatted = formatter.format(meta)
+                        source = data.get('source_engine', 'Google Books')
+                        results.append((meta, formatted, source))
+        except Exception as e:
+            print(f"[UnifiedRouter] Book engines error: {e}")
         
         # Then fill remaining with Crossref (journals, chapters)
         if len(results) < limit:
