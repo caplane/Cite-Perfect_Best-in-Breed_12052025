@@ -32,6 +32,8 @@ class ChicagoFormatter(BaseFormatter):
             return self._format_legal(metadata)
         elif metadata.citation_type == CitationType.INTERVIEW:
             return self._format_interview(metadata)
+        elif metadata.citation_type == CitationType.LETTER:
+            return self._format_letter(metadata)
         elif metadata.citation_type == CitationType.NEWSPAPER:
             return self._format_newspaper(metadata)
         elif metadata.citation_type == CitationType.GOVERNMENT:
@@ -53,6 +55,8 @@ class ChicagoFormatter(BaseFormatter):
             return self._format_legal_short(metadata)
         elif metadata.citation_type == CitationType.INTERVIEW:
             return self._format_interview_short(metadata)
+        elif metadata.citation_type == CitationType.LETTER:
+            return self._format_letter_short(metadata)
         else:
             return self._format_general_short(metadata)
     
@@ -240,6 +244,66 @@ class ChicagoFormatter(BaseFormatter):
         if m.interviewee:
             return self._ensure_period(f"{m.interviewee} interview")
         return self._ensure_period("Interview")
+    
+    # =========================================================================
+    # LETTER/CORRESPONDENCE
+    # =========================================================================
+    
+    def _format_letter(self, m: CitationMetadata) -> str:
+        """
+        Format letter/correspondence.
+        
+        Chicago 17th ed. pattern for personal communications:
+        Sender to Recipient, Date, Collection/Location. URL.
+        
+        With subject: Sender to Recipient, "Subject," Date, Collection. URL.
+        """
+        parts = []
+        
+        # Sender to Recipient
+        if m.sender and m.recipient:
+            parts.append(f"{m.sender} to {m.recipient}")
+        elif m.sender:
+            parts.append(m.sender)
+        elif m.recipient:
+            parts.append(f"Letter to {m.recipient}")
+        
+        # Subject/title in quotes (if present)
+        if m.title:
+            parts.append(f'"{m.title}"')
+        
+        # Date
+        if m.date:
+            parts.append(m.date)
+        
+        # Location/Collection
+        if m.location:
+            parts.append(m.location)
+        
+        # URL
+        if m.url:
+            parts.append(m.url)
+        
+        result = ", ".join(filter(None, parts))
+        return self._ensure_period(result)
+    
+    def _format_letter_short(self, m: CitationMetadata) -> str:
+        """Short form letter: Sender to Recipient, Date."""
+        parts = []
+        
+        if m.sender and m.recipient:
+            # Use last names only for short form
+            sender_last = self._get_last_name(m.sender)
+            recipient_last = self._get_last_name(m.recipient)
+            parts.append(f"{sender_last} to {recipient_last}")
+        elif m.sender:
+            parts.append(self._get_last_name(m.sender))
+        
+        if m.date:
+            parts.append(m.date)
+        
+        result = ", ".join(filter(None, parts))
+        return self._ensure_period(result)
     
     # =========================================================================
     # NEWSPAPER

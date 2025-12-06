@@ -29,6 +29,8 @@ class MLAFormatter(BaseFormatter):
             return self._format_legal(metadata)
         elif metadata.citation_type == CitationType.INTERVIEW:
             return self._format_interview(metadata)
+        elif metadata.citation_type == CitationType.LETTER:
+            return self._format_letter(metadata)
         elif metadata.citation_type == CitationType.NEWSPAPER:
             return self._format_newspaper(metadata)
         elif metadata.citation_type == CitationType.GOVERNMENT:
@@ -240,6 +242,48 @@ class MLAFormatter(BaseFormatter):
         # Date
         if m.date:
             parts.append(m.date + ".")
+        
+        result = " ".join(parts)
+        return self._ensure_period(result)
+    
+    # =========================================================================
+    # LETTER/CORRESPONDENCE
+    # =========================================================================
+    
+    def _format_letter(self, m: CitationMetadata) -> str:
+        """
+        MLA letter/correspondence.
+        
+        Pattern: Sender. Letter to Recipient. Date. Collection, Location.
+        Or: Sender. "Subject." Letter to Recipient. Date.
+        """
+        parts = []
+        
+        # Sender (MLA author format: Last, First)
+        if m.sender:
+            parts.append(self._format_authors_mla([m.sender]) + ".")
+        
+        # Subject in quotes (if present)
+        if m.title:
+            parts.append(f'"{m.title}."')
+        
+        # Letter description
+        if m.recipient:
+            parts.append(f"Letter to {m.recipient}.")
+        else:
+            parts.append("Letter.")
+        
+        # Date
+        if m.date:
+            parts.append(m.date + ".")
+        
+        # Collection/location
+        if m.location:
+            parts.append(m.location + ".")
+        
+        # URL
+        if m.url:
+            parts.append(m.url + ".")
         
         result = " ".join(parts)
         return self._ensure_period(result)
