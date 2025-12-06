@@ -9,8 +9,14 @@
     <style>
         /*
          * CiteFlex Unified - Workbench UI
-         * Version: 1.1.0
-         * Created: 2025-12-05 13:30
+         * Version: 1.2.0
+         * Updated: 2025-12-06 12:35
+         * 
+         * V1.2.0 Changes:
+         * - Final Citation box now appears at TOP (was bottom)
+         * - Pre-populates with auto-resolved result from get_citation()
+         * - User sees exactly what will go into document
+         * - Alternative Resolutions below allow override
          * 
          * Combines CiteFlex Pro (academic engines) with Cite Fix Pro (legal cache)
          * into a unified citation management workbench.
@@ -86,7 +92,7 @@
             </div>
             <div>
                 <h1 class="text-xl font-bold text-gray-900 tracking-tight">CiteFlex <span class="text-blue-600">Unified</span></h1>
-                <p class="text-xs text-gray-500 font-medium">Best-in-Breed Citation Workbench v1.1</p>
+                <p class="text-xs text-gray-500 font-medium">Best-in-Breed Citation Workbench v1.2</p>
             </div>
         </div>
         
@@ -192,11 +198,32 @@
                         <div id="active-original" class="text-gray-800 serif italic p-4 bg-gradient-to-br from-gray-50 to-slate-50 rounded-lg border border-gray-100 leading-relaxed text-lg"></div>
                     </div>
 
-                    <!-- Candidates Section -->
+                    <!-- Final Editor (moved to top - shows auto-resolved result) -->
+                    <div class="bg-white p-6 rounded-xl shadow-sm border-2 border-blue-200 ring-2 ring-blue-50">
+                        <h3 class="text-xs font-bold text-blue-600 uppercase mb-3 flex items-center gap-2">
+                            <i class="fas fa-pen-nib"></i> Final Citation
+                            <span class="text-[10px] font-normal text-gray-400 ml-2">(auto-resolved — edit or select alternative below)</span>
+                        </h3>
+                        <textarea id="final-edit-area" class="w-full p-4 border border-gray-300 rounded-lg serif text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-y min-h-[120px] leading-relaxed" placeholder="Auto-resolved citation will appear here..."></textarea>
+                        
+                        <div class="flex gap-3 mt-4 pt-4 border-t border-gray-100">
+                            <button onclick="commitChange()" id="commit-btn" class="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-medium py-3 rounded-lg transition-all shadow-sm flex items-center justify-center gap-2">
+                                <i class="fas fa-check"></i> Accept & Save
+                            </button>
+                            <button onclick="copyToClipboard()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Copy to clipboard">
+                                <i class="fas fa-copy text-gray-400"></i>
+                            </button>
+                            <button onclick="appendMode()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Append another source">
+                                <i class="fas fa-plus text-gray-400"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Candidates Section (alternatives below) -->
                     <div id="candidates-section">
                         <div class="flex justify-between items-center mb-3">
                             <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
-                                <i class="fas fa-magic text-gray-300"></i> Proposed Resolutions
+                                <i class="fas fa-magic text-gray-300"></i> Alternative Resolutions
                             </h3>
                             
                             <div class="flex items-center gap-2">
@@ -216,26 +243,6 @@
                         
                         <div id="candidates-list" class="space-y-3">
                             <!-- Candidates will be inserted here -->
-                        </div>
-                    </div>
-
-                    <!-- Final Editor -->
-                    <div class="bg-white p-6 rounded-xl shadow-sm border-2 border-blue-200 ring-2 ring-blue-50">
-                        <h3 class="text-xs font-bold text-blue-600 uppercase mb-3 flex items-center gap-2">
-                            <i class="fas fa-pen-nib"></i> Final Citation
-                        </h3>
-                        <textarea id="final-edit-area" class="w-full p-4 border border-gray-300 rounded-lg serif text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-y min-h-[120px] leading-relaxed" placeholder="Select a candidate above or type/edit manually..."></textarea>
-                        
-                        <div class="flex gap-3 mt-4 pt-4 border-t border-gray-100">
-                            <button onclick="commitChange()" id="commit-btn" class="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-medium py-3 rounded-lg transition-all shadow-sm flex items-center justify-center gap-2">
-                                <i class="fas fa-check"></i> Accept & Save
-                            </button>
-                            <button onclick="copyToClipboard()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Copy to clipboard">
-                                <i class="fas fa-copy text-gray-400"></i>
-                            </button>
-                            <button onclick="appendMode()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Append another source">
-                                <i class="fas fa-plus text-gray-400"></i>
-                            </button>
                         </div>
                     </div>
                     
@@ -258,8 +265,8 @@
     <script>
         /*
          * CiteFlex Unified - Frontend Logic
-         * Version: 1.1.0
-         * Created: 2025-12-05 13:30
+         * Version: 1.2.0
+         * Updated: 2025-12-06 12:35
          */
         
         let currentCitations = [];
@@ -392,12 +399,12 @@
             document.getElementById('active-id').innerText = `Note #${note.id}`;
             document.getElementById('active-original').innerText = note.text;
             
-            // Only auto-fill for rule-based forms (ibid/short)
-            // For new sources (full), leave empty so user must select from candidates
+            // Pre-populate Final Citation with the auto-resolved result
+            // This shows what will go into the document unless user overrides
+            document.getElementById('final-edit-area').value = note.formatted || '';
+            
+            // Mark ibid/short as already done since they're rule-based
             if (note.form === 'ibid' || note.form === 'short') {
-                document.getElementById('final-edit-area').value = note.formatted || '';
-                
-                // Mark as success in list since these are rule-based and already saved
                 if (note.success) {
                     const listItem = document.getElementById(`list-item-${note.id}`);
                     if (listItem && !listItem.classList.contains('status-success')) {
@@ -406,8 +413,6 @@
                         listItem.querySelector('p').innerHTML = `<i class="fas fa-check text-green-500 mr-1"></i>${(note.formatted || '').substring(0, 70)}...`;
                     }
                 }
-            } else {
-                document.getElementById('final-edit-area').value = '';
             }
             
             // Update type badge
