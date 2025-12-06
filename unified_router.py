@@ -12,6 +12,7 @@ Version History:
     2025-12-05 22:30 V2.3: Added famous papers cache (10,000 most-cited papers)
     2025-12-05 23:00 V2.4: Added Gemini AI fallback for UNKNOWN queries
     2025-12-05 22:45 V2.4: Fixed UNKNOWN routing to search books first
+    2025-12-06 V3.0: Switched to Claude API as primary AI router
 
 KEY IMPROVEMENTS OVER ORIGINAL router.py:
 1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
@@ -20,6 +21,7 @@ KEY IMPROVEMENTS OVER ORIGINAL router.py:
 3. Book search uses books.py's GoogleBooksAPI + OpenLibraryAPI with PUBLISHER_PLACE_MAP
 4. Academic search uses CiteFlex Pro's parallel engine execution
 5. Medical URL override prevents PubMed/NIH URLs from routing to government
+6. Claude AI router for ambiguous queries with multi-option support
 
 ARCHITECTURE:
 - Wrapper classes convert superlegal.py/books.py dicts → CitationMetadata
@@ -46,13 +48,52 @@ from engines import superlegal
 from engines import books
 from engines.famous_papers import find_famous_paper
 
-# Gemini AI fallback for ambiguous queries
+# =============================================================================
+# AI ROUTER CONFIGURATION (Claude primary, Gemini fallback)
+# =============================================================================
+
+import os
+AI_ROUTER = os.environ.get('AI_ROUTER', 'claude').lower()  # 'claude' or 'gemini'
+
+# Try to import Claude router (primary)
+try:
+    from claude_router import classify_with_claude, get_citation_options
+    CLAUDE_AVAILABLE = True
+except ImportError:
+    CLAUDE_AVAILABLE = False
+    print("[UnifiedRouter] Claude router not available")
+
+# Try to import Gemini router (fallback)
 try:
     from gemini_router import classify_with_gemini
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    print("[UnifiedRouter] Gemini router not available - UNKNOWN queries will use default routing")
+
+
+def classify_with_ai(query: str) -> Tuple[CitationType, Optional[CitationMetadata]]:
+    """
+    Use configured AI router (Claude preferred, Gemini fallback).
+    Returns (CitationType, optional metadata).
+    """
+    if AI_ROUTER == 'claude' and CLAUDE_AVAILABLE:
+        return classify_with_claude(query)
+    elif AI_ROUTER == 'gemini' and GEMINI_AVAILABLE:
+        return classify_with_gemini(query)
+    elif CLAUDE_AVAILABLE:
+        return classify_with_claude(query)
+    elif GEMINI_AVAILABLE:
+        return classify_with_gemini(query)
+    else:
+        return CitationType.UNKNOWN, None
+
+
+AI_AVAILABLE = CLAUDE_AVAILABLE or GEMINI_AVAILABLE
+if not AI_AVAILABLE:
+    print("[UnifiedRouter] No AI router available - UNKNOWN queries will use default routing")
+else:
+    active_router = "CLAUDE" if (AI_ROUTER == 'claude' and CLAUDE_AVAILABLE) or (not GEMINI_AVAILABLE and CLAUDE_AVAILABLE) else "GEMINI"
+    print(f"[UnifiedRouter] Using {active_router} for AI classification")
 
 
 # =============================================================================
@@ -167,194 +208,107 @@ def _route_book(query: str) -> Optional[CitationMetadata]:
     except Exception as e:
         print(f"[UnifiedRouter] Book search error: {e}")
     
-    # Fallback to CiteFlex Pro's Crossref (has book chapters)
-    try:
-        result = _crossref.search(query)
-        if result and result.has_minimum_data():
-            return result
-    except Exception:
-        pass
-    
     return None
 
 
 # =============================================================================
-# PARALLEL ENGINE EXECUTION (from CiteFlex Pro)
-# =============================================================================
-
-def _search_engines_parallel(
-    engines: List[Tuple[str, callable]],
-    query: str,
-    timeout: float = PARALLEL_TIMEOUT
-) -> Optional[CitationMetadata]:
-    """
-    Execute multiple search engines in parallel, return first valid result.
-    
-    This reduces worst-case latency from 40+ seconds to ~10 seconds.
-    """
-    if not engines:
-        return None
-    
-    with ThreadPoolExecutor(max_workers=min(len(engines), MAX_WORKERS)) as executor:
-        future_to_engine = {
-            executor.submit(fn, query): name
-            for name, fn in engines
-        }
-        
-        try:
-            for future in as_completed(future_to_engine, timeout=timeout):
-                engine_name = future_to_engine[future]
-                try:
-                    result = future.result(timeout=1)
-                    if result and result.has_minimum_data():
-                        print(f"[UnifiedRouter] Found via {engine_name}")
-                        return result
-                except Exception as e:
-                    print(f"[UnifiedRouter] {engine_name} failed: {e}")
-                    continue
-        except FuturesTimeout:
-            print(f"[UnifiedRouter] Parallel search timed out after {timeout}s")
-    
-    return None
-
-
-# =============================================================================
-# JOURNAL/ACADEMIC ROUTING (CiteFlex Pro engines)
+# UNIFIED JOURNAL SEARCH (parallel execution)
 # =============================================================================
 
 def _route_journal(query: str) -> Optional[CitationMetadata]:
     """
-    Route journal/article queries using CiteFlex Pro's academic engines.
-    Runs Crossref, OpenAlex, and Semantic Scholar in parallel.
+    Route journal/academic queries using parallel API execution.
+    
+    Engines tried (in parallel):
+    1. Crossref - best for DOIs, formal citations
+    2. OpenAlex - good coverage, fast
+    3. Semantic Scholar - good for author+title queries
+    4. PubMed - medical/life sciences
     """
-    # Check famous papers cache first (instant lookup for 10,000 most-cited)
-    famous = find_famous_paper(query)
-    if famous:
-        result = _crossref.get_by_id(famous["doi"])
-        if result:
-            print("[UnifiedRouter] Found via Famous Papers cache")
-            return result
+    results = []
     
-    # Check for DOI in query first (instant lookup)
-    doi_match = re.search(r'(10\.\d{4,}/[^\s]+)', query)
-    if doi_match:
-        doi = doi_match.group(1).rstrip('.,;')
-        result = _crossref.get_by_id(doi)
-        if result:
-            print("[UnifiedRouter] Found via direct DOI lookup")
-            return result
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_crossref.search, query): "Crossref",
+            executor.submit(_openalex.search, query): "OpenAlex",
+            executor.submit(_semantic.search, query): "Semantic Scholar",
+            executor.submit(_pubmed.search, query): "PubMed",
+        }
+        
+        for future in as_completed(futures, timeout=PARALLEL_TIMEOUT):
+            engine_name = futures[future]
+            try:
+                result = future.result(timeout=2)
+                if result and result.has_minimum_data():
+                    result.source_engine = engine_name
+                    results.append(result)
+            except Exception:
+                pass
     
-    # Parallel search across academic engines
-    engines = [
-        ("Crossref", _crossref.search),
-        ("OpenAlex", _openalex.search),
-        ("Semantic Scholar", _semantic.search),
-    ]
+    # Return best result (prefer one with DOI)
+    if results:
+        for r in results:
+            if r.doi:
+                return r
+        return results[0]
     
-    return _search_engines_parallel(engines, query)
+    return None
 
 
 # =============================================================================
-# MEDICAL ROUTING (CiteFlex Pro PubMed + academic engines)
-# =============================================================================
-
-def _route_medical(query: str) -> Optional[CitationMetadata]:
-    """
-    Route medical/clinical queries.
-    Tries PubMed first (specialized), then falls back to academic engines.
-    """
-    # Check for PMID
-    pmid_match = re.search(r'(?:pmid:?\s*|pubmed:?\s*)(\d+)', query, re.IGNORECASE)
-    if pmid_match:
-        pmid = pmid_match.group(1)
-        result = _pubmed.get_by_id(pmid)
-        if result:
-            print("[UnifiedRouter] Found via direct PMID lookup")
-            return result
-    
-    # Parallel search: PubMed + academic engines
-    engines = [
-        ("PubMed", _pubmed.search),
-        ("Crossref", _crossref.search),
-        ("Semantic Scholar", _semantic.search),
-    ]
-    
-    return _search_engines_parallel(engines, query)
-
-
-# =============================================================================
-# URL ROUTING (with medical domain override)
+# URL ROUTING
 # =============================================================================
 
 def _is_medical_url(url: str) -> bool:
-    """Check if URL is from a medical domain (should route to PubMed, not gov)."""
-    lower = url.lower()
-    return any(domain in lower for domain in MEDICAL_DOMAINS)
-
-
-def _is_newspaper_url(url: str) -> bool:
-    """Check if URL is from a newspaper domain."""
-    lower = url.lower()
-    return any(domain in lower for domain in NEWSPAPER_DOMAINS.keys())
-
-
-def _is_government_url(url: str) -> bool:
-    """Check if URL is from a government domain."""
-    return '.gov' in url.lower() and not _is_medical_url(url)
+    """Check if URL is a medical resource (PubMed, NIH, etc.)."""
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in MEDICAL_DOMAINS)
 
 
 def _route_url(url: str) -> Optional[CitationMetadata]:
     """
-    Route URL-based queries with smart domain detection.
+    Route URL-based queries.
     
     Priority:
-    1. Medical URLs → PubMed (override .gov for NIH/PubMed)
-    2. Academic publisher URLs → DOI extraction → Crossref
-    3. Government URLs → basic metadata extraction
-    4. Newspaper URLs → basic metadata extraction
-    5. Generic URLs → basic metadata
+    1. Extract DOI from URL → Crossref lookup
+    2. Academic publisher URL → Crossref search
+    3. Medical URL → PubMed
+    4. Newspaper URL → Newspaper extractor
+    5. Government URL → Government extractor
+    6. Generic URL → Basic metadata extraction
     """
-    # 1. Medical URL override (PubMed, NIH, etc.)
-    if _is_medical_url(url):
-        # Try to extract PMID from URL
-        pmid_match = re.search(r'/(\d{7,8})/?', url)
-        if pmid_match:
-            result = _pubmed.get_by_id(pmid_match.group(1))
-            if result:
+    # Check for DOI in URL
+    doi = extract_doi_from_url(url)
+    if doi:
+        try:
+            result = _crossref.search_by_doi(doi)
+            if result and result.has_minimum_data():
                 result.url = url
                 return result
-        # Fall back to medical routing
-        return _route_medical(url)
+        except Exception:
+            pass
     
-    # 2. Academic publisher URL → DOI extraction
+    # Check for academic publisher
     if is_academic_publisher_url(url):
-        doi = extract_doi_from_url(url)
-        if doi:
-            result = _crossref.get_by_id(doi)
-            if result:
+        try:
+            result = _crossref.search(url)
+            if result and result.has_minimum_data():
                 result.url = url
-                print("[UnifiedRouter] Found via DOI extraction from URL")
                 return result
+        except Exception:
+            pass
     
-    # 3. Try generic DOI extraction from URL path
-    doi_match = re.search(r'(10\.\d{4,}/[^\s?#]+)', url)
-    if doi_match:
-        doi = doi_match.group(1).rstrip('.,;')
-        result = _crossref.get_by_id(doi)
-        if result:
-            result.url = url
-            print("[UnifiedRouter] Found via DOI in URL path")
-            return result
+    # Medical URLs go to PubMed
+    if _is_medical_url(url):
+        try:
+            result = _pubmed.search(url)
+            if result and result.has_minimum_data():
+                result.url = url
+                return result
+        except Exception:
+            pass
     
-    # 4. Government URL
-    if _is_government_url(url):
-        return extract_by_type(url, CitationType.GOVERNMENT)
-    
-    # 5. Newspaper URL
-    if _is_newspaper_url(url):
-        return extract_by_type(url, CitationType.NEWSPAPER)
-    
-    # 6. Generic URL
+    # Fallback to standard extraction
     return extract_by_type(url, CitationType.URL)
 
 
@@ -362,224 +316,164 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
 # MAIN ROUTING FUNCTION
 # =============================================================================
 
-def route_citation(query: str) -> Tuple[Optional[CitationMetadata], DetectionResult]:
+def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[CitationMetadata], str]:
     """
-    Main routing function with unified detection and search.
+    Main entry point: route query to appropriate engine and format result.
     
-    KEY DIFFERENCE from original router.py:
-    - Uses superlegal.is_legal_citation() for legal detection (cache-aware)
-    - This catches bare case names like "Roe v Wade" that regex misses
+    Returns: (CitationMetadata, formatted_citation_string)
     """
     query = query.strip()
+    if not query:
+        return None, ""
     
-    # ==========================================================================
-    # STEP 1: Check if it's a legal citation using superlegal.py's cache-aware detector
-    # ==========================================================================
-    if superlegal.is_legal_citation(query):
-        print(f"[UnifiedRouter] Detected: LEGAL (cache-aware)")
-        metadata = _route_legal(query)
-        if metadata:
-            return metadata, DetectionResult(
-                citation_type=CitationType.LEGAL,
-                confidence=0.95,
-                cleaned_query=query
-            )
-    
-    # ==========================================================================
-    # STEP 2: Use CiteFlex Pro's pattern detection for other types
-    # ==========================================================================
-    detection = detect_type(query)
-    print(f"[UnifiedRouter] Detected: {detection.citation_type.name} (confidence: {detection.confidence})")
-    
+    formatter = get_formatter(style)
     metadata = None
     
-    # ==========================================================================
-    # STEP 3: Route based on detected type
-    # ==========================================================================
-    
-    if detection.citation_type == CitationType.INTERVIEW:
-        metadata = extract_by_type(query, CitationType.INTERVIEW)
-    
-    elif detection.citation_type == CitationType.LEGAL:
-        # Already checked above, but try again in case detection differs
+    # 1. Check for legal citation FIRST (superlegal.py handles famous cases)
+    if superlegal.is_legal_citation(query):
         metadata = _route_legal(query)
+        if metadata:
+            return metadata, formatter.format(metadata)
     
-    elif detection.citation_type == CitationType.GOVERNMENT:
-        metadata = extract_by_type(query, CitationType.GOVERNMENT)
+    # 2. Check for URL
+    if is_url(query):
+        metadata = _route_url(query)
+        if metadata:
+            return metadata, formatter.format(metadata)
     
-    elif detection.citation_type == CitationType.NEWSPAPER:
-        metadata = extract_by_type(query, CitationType.NEWSPAPER)
+    # 3. Detect type using standard detectors
+    detection = detect_type(query)
     
-    elif detection.citation_type == CitationType.MEDICAL:
-        metadata = _route_medical(query)
-    
-    elif detection.citation_type == CitationType.JOURNAL:
-        metadata = _route_journal(query)
+    # 4. Route based on detection
+    if detection.citation_type == CitationType.LEGAL:
+        metadata = _route_legal(query)
     
     elif detection.citation_type == CitationType.BOOK:
         metadata = _route_book(query)
     
-    elif detection.citation_type == CitationType.URL:
-        metadata = _route_url(query)
+    elif detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
+        # Check famous papers cache first
+        famous = find_famous_paper(query)
+        if famous:
+            metadata = CitationMetadata(
+                citation_type=CitationType.JOURNAL,
+                raw_source=query,
+                source_engine="Famous Papers Cache",
+                **famous
+            )
+        else:
+            metadata = _route_journal(query)
     
-    elif detection.citation_type == CitationType.UNKNOWN:
-        # Try Gemini AI to classify ambiguous queries
-        if GEMINI_AVAILABLE:
-            gemini_type, gemini_meta = classify_with_gemini(query)
-            if gemini_type != CitationType.UNKNOWN:
-                print(f"[UnifiedRouter] Gemini classified as: {gemini_type.name}")
+    elif detection.citation_type == CitationType.NEWSPAPER:
+        metadata = extract_by_type(query, CitationType.NEWSPAPER)
+    
+    elif detection.citation_type == CitationType.GOVERNMENT:
+        metadata = extract_by_type(query, CitationType.GOVERNMENT)
+    
+    elif detection.citation_type == CitationType.INTERVIEW:
+        metadata = extract_by_type(query, CitationType.INTERVIEW)
+    
+    else:
+        # UNKNOWN: Try AI classification first
+        if AI_AVAILABLE:
+            ai_type, ai_meta = classify_with_ai(query)
+            if ai_type != CitationType.UNKNOWN:
+                print(f"[UnifiedRouter] AI classified as: {ai_type.name}")
                 
-                if gemini_type == CitationType.BOOK:
+                if ai_type == CitationType.BOOK:
                     metadata = _route_book(query)
-                elif gemini_type == CitationType.LEGAL:
+                elif ai_type == CitationType.LEGAL:
                     metadata = _route_legal(query)
-                elif gemini_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
+                elif ai_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
                     metadata = _route_journal(query)
-                elif gemini_type == CitationType.NEWSPAPER:
+                elif ai_type == CitationType.NEWSPAPER:
                     metadata = extract_by_type(query, CitationType.NEWSPAPER)
-                elif gemini_type == CitationType.GOVERNMENT:
+                elif ai_type == CitationType.GOVERNMENT:
                     metadata = extract_by_type(query, CitationType.GOVERNMENT)
-                
-                if metadata:
-                    return metadata, detection
         
-        # Fallback: Try journal engines as default, then book
-        metadata = _route_journal(query)
+        # Fallback: try books first, then journals
         if not metadata:
             metadata = _route_book(query)
+        if not metadata:
+            metadata = _route_journal(query)
     
-    return metadata, detection
+    # Format and return
+    if metadata:
+        return metadata, formatter.format(metadata)
+    
+    return None, ""
 
 
 # =============================================================================
-# HIGH-LEVEL API (same interface as original router.py)
+# MULTIPLE RESULTS FUNCTION
 # =============================================================================
 
-def get_citation(
-    query: str,
-    style: str = "Chicago Manual of Style"
-) -> Tuple[Optional[CitationMetadata], Optional[str]]:
+def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -> List[Tuple[CitationMetadata, str, str]]:
     """
-    Main entry point for getting a formatted citation.
+    Get multiple citation candidates for user selection.
     
-    This is the function imported by document_processor.py.
-    
-    Args:
-        query: The citation query (URL, title, case name, etc.)
-        style: Citation style name
-        
-    Returns:
-        Tuple of (CitationMetadata, formatted_citation_string)
-        Both may be None if lookup fails.
+    Returns list of (metadata, formatted_citation, source_name) tuples.
     """
-    metadata, detection = route_citation(query)
-    
-    if not metadata or not metadata.has_minimum_data():
-        print(f"[UnifiedRouter] No metadata found for: {query[:50]}...")
-        return None, None
+    query = query.strip()
+    if not query:
+        return []
     
     formatter = get_formatter(style)
-    formatted = formatter.format(metadata)
-    
-    return metadata, formatted
-
-
-def get_multiple_citations(
-    query: str,
-    style: str = "Chicago Manual of Style",
-    limit: int = 5
-) -> List[Tuple[CitationMetadata, str, str]]:
-    """
-    Get multiple citation options for a query.
-    
-    Args:
-        query: Search query
-        style: Citation style
-        limit: Maximum results
-        
-    Returns:
-        List of (CitationMetadata, formatted_string, source_name) tuples
-    """
     results = []
-    formatter = get_formatter(style)
     
-    # ==========================================================================
-    # STEP 0: URL with DOI - extract and lookup directly (MUST BE FIRST)
-    # ==========================================================================
+    # Detect type
+    detection = detect_type(query)
+    
+    # Check for URL with DOI first
     if is_url(query):
-        # Try academic publisher URL first
-        if is_academic_publisher_url(query):
-            doi = extract_doi_from_url(query)
-            if doi:
-                result = _crossref.get_by_id(doi)
+        doi = extract_doi_from_url(query)
+        if doi:
+            try:
+                result = _crossref.search_by_doi(doi)
                 if result and result.has_minimum_data():
-                    result.url = query  # Preserve original URL
+                    result.url = query
                     formatted = formatter.format(result)
                     results.append((result, formatted, "Crossref (DOI)"))
-                    return results  # DOI lookup is authoritative
-        
-        # Try extracting DOI from URL path (e.g., /doi/10.1086/737056)
-        doi_match = re.search(r'(10\.\d{4,}/[^\s?#]+)', query)
-        if doi_match:
-            doi = doi_match.group(1).rstrip('.,;')
-            result = _crossref.get_by_id(doi)
-            if result and result.has_minimum_data():
-                result.url = query
-                formatted = formatter.format(result)
-                results.append((result, formatted, "Crossref (DOI)"))
-                return results  # DOI lookup is authoritative
-        
-        # For non-DOI URLs, route through _route_url
-        metadata = _route_url(query)
-        if metadata and metadata.has_minimum_data():
-            formatted = formatter.format(metadata)
-            source = metadata.source_engine or "URL"
-            results.append((metadata, formatted, source))
-            return results
+            except Exception:
+                pass
     
-    # ==========================================================================
-    # STEP 0.5: Check famous papers cache (10,000 most-cited papers)
-    # ==========================================================================
-    famous = find_famous_paper(query)
-    if famous:
-        # Use DOI to get full metadata from Crossref
-        result = _crossref.get_by_id(famous["doi"])
-        if result and result.has_minimum_data():
-            formatted = formatter.format(result)
-            results.append((result, formatted, "Famous Papers"))
-            return results  # Famous paper lookup is authoritative
-    
-    # ==========================================================================
-    # STEP 1: Check if legal
-    # ==========================================================================
-    if superlegal.is_legal_citation(query):
+    # Check for legal citation
+    if superlegal.is_legal_citation(query) or detection.citation_type == CitationType.LEGAL:
         metadata = _route_legal(query)
         if metadata:
             formatted = formatter.format(metadata)
-            source = metadata.source_engine or "Legal Cache"
-            results.append((metadata, formatted, source))
-        return results
+            results.append((metadata, formatted, "Legal Cache"))
+        return results  # Legal citations typically have one authoritative result
     
-    # ==========================================================================
-    # STEP 2: Detection-based routing
-    # ==========================================================================
-    detection = detect_type(query)
-    
-    if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
-        # Try Crossref first
-        metadatas = _crossref.search_multiple(query, limit)
-        for meta in metadatas:
-            if meta and meta.has_minimum_data():
-                formatted = formatter.format(meta)
-                source = meta.source_engine or "Crossref"
-                results.append((meta, formatted, source))
+    # For journals/academic
+    if detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL, CitationType.UNKNOWN]:
+        # Check famous papers first
+        famous = find_famous_paper(query)
+        if famous:
+            meta = CitationMetadata(
+                citation_type=CitationType.JOURNAL,
+                raw_source=query,
+                source_engine="Famous Papers Cache",
+                **famous
+            )
+            formatted = formatter.format(meta)
+            results.append((meta, formatted, "Famous Papers"))
         
-        # Also try Semantic Scholar if we have room (catches author+title queries better)
+        # Query multiple engines
+        try:
+            metadatas = _crossref.search_multiple(query, limit)
+            for meta in metadatas:
+                if meta and meta.has_minimum_data():
+                    formatted = formatter.format(meta)
+                    results.append((meta, formatted, "Crossref"))
+        except Exception:
+            pass
+        
+        # Add Semantic Scholar results
         if len(results) < limit:
             try:
                 ss_result = _semantic.search(query)
                 if ss_result and ss_result.has_minimum_data():
-                    # Avoid duplicates by checking title similarity
                     is_duplicate = any(
                         ss_result.title and r[0].title and 
                         ss_result.title.lower()[:30] == r[0].title.lower()[:30]
@@ -615,7 +509,7 @@ def get_multiple_citations(
             except Exception:
                 pass
         
-        # Also try Semantic Scholar - "author title" could be a journal article
+        # Also try Semantic Scholar
         if len(results) < limit:
             try:
                 ss_result = _semantic.search(query)
@@ -632,14 +526,14 @@ def get_multiple_citations(
                 pass
     
     elif detection.citation_type == CitationType.UNKNOWN:
-        # Try Gemini AI to classify ambiguous queries
-        if GEMINI_AVAILABLE:
-            gemini_type, gemini_meta = classify_with_gemini(query)
-            if gemini_type != CitationType.UNKNOWN:
-                print(f"[UnifiedRouter] Gemini classified as: {gemini_type.name}")
+        # Try AI router to classify ambiguous queries
+        if AI_AVAILABLE:
+            ai_type, ai_meta = classify_with_ai(query)
+            if ai_type != CitationType.UNKNOWN:
+                print(f"[UnifiedRouter] AI classified as: {ai_type.name}")
                 
-                # Route based on Gemini's classification
-                if gemini_type == CitationType.BOOK:
+                # Route based on AI's classification
+                if ai_type == CitationType.BOOK:
                     try:
                         book_results = books.extract_metadata(query)
                         for data in book_results[:limit]:
@@ -650,7 +544,7 @@ def get_multiple_citations(
                                 results.append((meta, formatted, source))
                     except Exception:
                         pass
-                    # Also try Semantic Scholar - "author title" could be a journal article
+                    # Also try Semantic Scholar
                     if len(results) < limit:
                         try:
                             ss_result = _semantic.search(query)
@@ -667,20 +561,20 @@ def get_multiple_citations(
                             pass
                     return results[:limit]
                 
-                elif gemini_type == CitationType.LEGAL:
+                elif ai_type == CitationType.LEGAL:
                     metadata = _route_legal(query)
                     if metadata:
                         formatted = formatter.format(metadata)
                         results.append((metadata, formatted, "Legal Cache"))
                     return results
                 
-                elif gemini_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
+                elif ai_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
                     metadatas = _crossref.search_multiple(query, limit)
                     for meta in metadatas:
                         if meta and meta.has_minimum_data():
                             formatted = formatter.format(meta)
                             results.append((meta, formatted, "Crossref"))
-                    # Also try Semantic Scholar (better for author+title queries)
+                    # Also try Semantic Scholar
                     if len(results) < limit:
                         try:
                             ss_result = _semantic.search(query)
@@ -700,7 +594,7 @@ def get_multiple_citations(
         # Fallback: try book engines FIRST (often what users want)
         try:
             book_results = books.extract_metadata(query)
-            for data in book_results[:3]:  # Up to 3 book results
+            for data in book_results[:3]:
                 meta = _book_dict_to_metadata(data, query)
                 if meta:
                     formatted = formatter.format(meta)
@@ -720,7 +614,7 @@ def get_multiple_citations(
             except Exception:
                 pass
         
-        # Finally try Semantic Scholar (best for author+title queries like "caplan trains brains")
+        # Finally try Semantic Scholar
         if len(results) < limit:
             try:
                 ss_result = _semantic.search(query)
@@ -737,6 +631,43 @@ def get_multiple_citations(
                 pass
     
     return results[:limit]
+
+
+# =============================================================================
+# MULTI-OPTION CITATIONS (uses Claude's get_citation_options)
+# =============================================================================
+
+def get_citation_options_formatted(query: str, style: str = "chicago", limit: int = 5) -> List[dict]:
+    """
+    Get multiple citation options using Claude AI + multiple APIs.
+    
+    This is the preferred method for ambiguous queries like "Caplan mind games".
+    Returns list of dicts with {citation, source, title, authors, year, ...}.
+    
+    Uses claude_router.get_citation_options() which searches:
+    - Google Books
+    - Crossref  
+    - PubMed
+    - Famous Cases Cache
+    """
+    if CLAUDE_AVAILABLE:
+        try:
+            return get_citation_options(query, max_options=limit)
+        except Exception as e:
+            print(f"[UnifiedRouter] Claude options error: {e}")
+    
+    # Fallback to standard multiple citations
+    results = get_multiple_citations(query, style, limit)
+    return [
+        {
+            "citation": formatted,
+            "source": source,
+            "title": meta.title if meta else "",
+            "authors": meta.authors if meta else [],
+            "year": meta.year if meta else ""
+        }
+        for meta, formatted, source in results
+    ]
 
 
 # =============================================================================
