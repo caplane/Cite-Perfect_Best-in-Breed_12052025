@@ -707,68 +707,57 @@ class WordDocumentProcessor:
 class LinkActivator:
     """
     Post-processing module that converts plain text URLs in Word documents
-    into clickable hyperlinks. Processes document.xml, endnotes.xml, and footnotes.xml.
+    into clickable hyperlinks.
     
-    REWRITTEN: Uses proper XML parsing instead of regex to avoid document corruption.
+    Processes document.xml, endnotes.xml, and footnotes.xml to find URLs
+    and convert them to proper Word HYPERLINK field codes with blue
+    underlined styling.
+    
+    RESTORED: Using proper HYPERLINK field codes for actual clickable links.
     """
     
-    NS = {
-        'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
-        'xml': 'http://www.w3.org/XML/1998/namespace',
-        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-    }
-    
-    # URL pattern
+    # Pattern to match URLs
     URL_PATTERN = re.compile(r'(https?://[^\s<>"]+)')
     
     @classmethod
     def process(cls, docx_buffer: BytesIO) -> BytesIO:
         """
-        Process a docx buffer to make all URLs clickable.
-        
-        Uses proper XML parsing to avoid document corruption.
+        Process a .docx file to make all URLs clickable.
         
         Args:
-            docx_buffer: BytesIO containing the .docx file
+            docx_buffer: BytesIO containing the input .docx file
             
         Returns:
-            BytesIO containing the processed .docx file
+            BytesIO containing the processed .docx file with clickable URLs
         """
         temp_dir = tempfile.mkdtemp()
         
         try:
-            # Extract docx
+            # Extract docx to temp directory
             docx_buffer.seek(0)
-            with zipfile.ZipFile(docx_buffer, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+            with zipfile.ZipFile(docx_buffer, 'r') as zf:
+                zf.extractall(temp_dir)
             
-            # Register namespaces
-            ET.register_namespace('w', cls.NS['w'])
-            ET.register_namespace('xml', cls.NS['xml'])
-            ET.register_namespace('r', cls.NS['r'])
-            
-            # Process each target file
-            target_files = ['word/document.xml', 'word/endnotes.xml', 'word/footnotes.xml']
+            # Process each relevant XML file
+            target_files = [
+                'word/document.xml',
+                'word/endnotes.xml',
+                'word/footnotes.xml'
+            ]
             
             for xml_file in target_files:
                 full_path = os.path.join(temp_dir, xml_file)
-                if not os.path.exists(full_path):
-                    continue
-                
-                try:
+                if os.path.exists(full_path):
                     cls._process_xml_file(full_path)
-                except Exception as e:
-                    print(f"[LinkActivator] Error processing {xml_file}: {e}")
-                    # Continue with other files even if one fails
             
             # Repackage as docx
             output_buffer = BytesIO()
-            with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for root, dirs, files in os.walk(temp_dir):
                     for file in files:
                         file_path = os.path.join(root, file)
                         arcname = os.path.relpath(file_path, temp_dir)
-                        zipf.write(file_path, arcname)
+                        zf.write(file_path, arcname)
             
             output_buffer.seek(0)
             return output_buffer
@@ -779,72 +768,103 @@ class LinkActivator:
             return docx_buffer
             
         finally:
-            shutil.rmtree(temp_dir)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
     
     @classmethod
-    def _process_xml_file(cls, file_path: str) -> None:
+    def _process_xml_file(cls, file_path: str):
+        """Process a single XML file to convert URLs to hyperlinks."""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Pattern to find URLs within w:t elements
+        pattern = r'(<w:t[^>]*>)([^<]*?)(https?://[^\s<>"]+)([^<]*?)(</w:t>)'
+        
+        def replace_url(match):
+            t_open = match.group(1)
+            text_before = match.group(2)
+            url = match.group(3)
+            text_after = match.group(4)
+            t_close = match.group(5)
+            
+            # Check if this is inside a hyperlink (crude check)
+            pos = match.start()
+            context_before = content[max(0, pos-500):pos]
+            
+            # Count hyperlink opens vs closes before this point
+            hyperlink_opens = context_before.count('<w:hyperlink')
+            hyperlink_closes = context_before.count('</w:hyperlink>')
+            
+            # Also check for HYPERLINK in instrText (field-based hyperlinks)
+            if 'HYPERLINK' in context_before[-200:]:
+                return match.group(0)  # Already a hyperlink, skip
+            
+            if hyperlink_opens > hyperlink_closes:
+                return match.group(0)  # Inside a hyperlink, skip
+            
+            # Clean URL
+            clean_url = url.rstrip('.,;:)]\'"')
+            trailing = url[len(clean_url):]
+            safe_url = html.escape(clean_url)
+            
+            # Build result
+            result = ""
+            
+            # Text before URL (if any)
+            if text_before:
+                result += f'{t_open}{text_before}{t_close}</w:r>'
+            else:
+                result += '</w:r>'
+            
+            # The hyperlink field
+            result += cls._build_hyperlink_field(safe_url, clean_url)
+            
+            # Text after URL (if any), including any trailing punctuation
+            after_text = trailing + text_after
+            if after_text:
+                result += f'<w:r>{t_open}{after_text}{t_close}'
+            else:
+                result += '<w:r>'
+            
+            return result
+        
+        # Apply the replacement
+        new_content = re.sub(pattern, replace_url, content)
+        
+        # Write back
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+    
+    @classmethod
+    def _build_hyperlink_field(cls, safe_url: str, display_text: str) -> str:
         """
-        Process a single XML file to convert URLs to hyperlinks.
+        Build Word HYPERLINK field XML.
         
-        Uses proper XML parsing instead of regex.
+        Structure:
+        - fldChar begin
+        - instrText with HYPERLINK "url"
+        - fldChar separate
+        - Display text (blue, underlined)
+        - fldChar end
         """
-        tree = ET.parse(file_path)
-        root = tree.getroot()
+        # Escape display text for XML
+        safe_display = html.escape(display_text)
         
-        w_ns = cls.NS['w']
-        xml_ns = cls.NS['xml']
+        field_xml = (
+            # Field begin
+            '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+            # Field instruction
+            f'<w:r><w:instrText xml:space="preserve"> HYPERLINK "{safe_url}" </w:instrText></w:r>'
+            # Field separator
+            '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+            # Display text with hyperlink styling (blue, underlined)
+            f'<w:r><w:rPr><w:color w:val="0000FF"/><w:u w:val="single"/></w:rPr>'
+            f'<w:t>{safe_display}</w:t></w:r>'
+            # Field end
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+        )
         
-        # Find all text elements
-        modified = False
-        
-        for t_elem in root.findall(f".//{{{w_ns}}}t"):
-            if t_elem.text and cls.URL_PATTERN.search(t_elem.text):
-                text = t_elem.text
-                
-                # Check if parent run is already part of a hyperlink (skip if so)
-                parent_run = t_elem.find('..')
-                if parent_run is not None:
-                    # Check ancestors for hyperlink - simplified check
-                    # In Word XML, hyperlinks use w:hyperlink wrapper
-                    # We'll just mark URLs visually instead of creating complex field codes
-                    pass
-                
-                # Find URL in text
-                match = cls.URL_PATTERN.search(text)
-                if match:
-                    url = match.group(1)
-                    # Clean trailing punctuation
-                    clean_url = url.rstrip('.,;:)')
-                    
-                    # For simplicity and safety, we'll just add visual styling
-                    # (blue underlined text) rather than creating complex field codes
-                    # which can corrupt documents
-                    
-                    # Get parent run
-                    run = t_elem.getparent() if hasattr(t_elem, 'getparent') else None
-                    if run is not None:
-                        # Add styling to indicate it's a link
-                        rPr = run.find(f"{{{w_ns}}}rPr")
-                        if rPr is None:
-                            rPr = ET.Element(f"{{{w_ns}}}rPr")
-                            run.insert(0, rPr)
-                        
-                        # Add blue color
-                        color = rPr.find(f"{{{w_ns}}}color")
-                        if color is None:
-                            color = ET.SubElement(rPr, f"{{{w_ns}}}color")
-                        color.set(f"{{{w_ns}}}val", "0000FF")
-                        
-                        # Add underline
-                        underline = rPr.find(f"{{{w_ns}}}u")
-                        if underline is None:
-                            underline = ET.SubElement(rPr, f"{{{w_ns}}}u")
-                        underline.set(f"{{{w_ns}}}val", "single")
-                        
-                        modified = True
-        
-        if modified:
-            tree.write(file_path, encoding='UTF-8', xml_declaration=True)
+        return field_xml
 
 
 def process_document(
