@@ -4,6 +4,8 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
+    2025-12-06 12:45: Added file-based session persistence to survive deployments
+                      Sessions saved to /data/sessions (Railway Volume mount point)
     2025-12-05 12:53: Thread-safe session management with threading.Lock()
     2025-12-05 13:35: Updated to use unified_router, added /api/update endpoint
                       Enhanced /api/cite to return type and source info
@@ -11,14 +13,17 @@ Version History:
 
 FIXES APPLIED:
 1. Thread-safe session management with threading.Lock()
-2. Session expiration (1 hour) to prevent memory leaks
+2. Session expiration (4 hours) to prevent memory leaks
 3. Periodic cleanup of expired sessions
+4. File-based persistence for sessions (survives deployments with Railway Volume)
 """
 
 import os
 import uuid
 import time
 import threading
+import pickle
+from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -39,26 +44,123 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-prod'
 ALLOWED_EXTENSIONS = {'docx'}
 
 # =============================================================================
-# FIX: THREAD-SAFE SESSION MANAGEMENT
+# FIX: PERSISTENT SESSION MANAGEMENT
 # =============================================================================
+
+# Session storage directory - use Railway Volume mount point for persistence
+SESSIONS_DIR = Path(os.environ.get('SESSIONS_DIR', '/data/sessions'))
 
 class SessionManager:
     """
-    Thread-safe session manager with expiration.
+    Thread-safe session manager with file-based persistence.
     
-    Fixes:
-    1. Race condition: Uses threading.Lock() for thread safety
-    2. Memory leak: Sessions expire after 1 hour
-    3. Multi-worker: Each worker has its own sessions (use Redis for shared state)
+    Features:
+    1. Thread-safe with threading.Lock()
+    2. Sessions expire after 4 hours
+    3. Persists to disk - survives server restarts/deployments
+    4. Requires Railway Volume mounted at /data for full persistence
+    
+    Setup for Railway:
+    1. Go to your service in Railway
+    2. Add a Volume: Settings → Volumes → Add Volume
+    3. Mount path: /data
+    4. Sessions will now survive deployments
     """
     
-    SESSION_EXPIRY_HOURS = 4  # Extended from 1 hour for longer editing sessions
+    SESSION_EXPIRY_HOURS = 4
     CLEANUP_INTERVAL_MINUTES = 15
     
-    def __init__(self):
+    def __init__(self, storage_dir: Path = SESSIONS_DIR):
         self._sessions = {}
         self._lock = threading.Lock()
         self._last_cleanup = time.time()
+        self._storage_dir = storage_dir
+        self._persistence_available = False
+        
+        # Try to set up persistent storage
+        self._init_storage()
+        
+        # Load existing sessions from disk
+        self._load_sessions()
+    
+    def _init_storage(self):
+        """Initialize storage directory if possible."""
+        try:
+            self._storage_dir.mkdir(parents=True, exist_ok=True)
+            # Test write access
+            test_file = self._storage_dir / '.test'
+            test_file.write_text('test')
+            test_file.unlink()
+            self._persistence_available = True
+            print(f"[SessionManager] Persistent storage enabled at {self._storage_dir}")
+        except Exception as e:
+            self._persistence_available = False
+            print(f"[SessionManager] Persistent storage unavailable ({e}). Using in-memory only.")
+            print("[SessionManager] To enable persistence, add a Railway Volume mounted at /data")
+    
+    def _get_session_file(self, session_id: str) -> Path:
+        """Get the file path for a session."""
+        return self._storage_dir / f"{session_id}.pkl"
+    
+    def _save_session(self, session_id: str):
+        """Save a single session to disk."""
+        if not self._persistence_available:
+            return
+        try:
+            session = self._sessions.get(session_id)
+            if session:
+                with open(self._get_session_file(session_id), 'wb') as f:
+                    pickle.dump(session, f)
+        except Exception as e:
+            print(f"[SessionManager] Failed to save session {session_id[:8]}: {e}")
+    
+    def _delete_session_file(self, session_id: str):
+        """Delete session file from disk."""
+        if not self._persistence_available:
+            return
+        try:
+            session_file = self._get_session_file(session_id)
+            if session_file.exists():
+                session_file.unlink()
+        except Exception as e:
+            print(f"[SessionManager] Failed to delete session file {session_id[:8]}: {e}")
+    
+    def _load_sessions(self):
+        """Load all sessions from disk on startup."""
+        if not self._persistence_available:
+            return
+        
+        loaded = 0
+        expired = 0
+        current_time = datetime.now()
+        
+        try:
+            for session_file in self._storage_dir.glob("*.pkl"):
+                try:
+                    with open(session_file, 'rb') as f:
+                        session = pickle.load(f)
+                    
+                    # Check if expired
+                    if current_time > session.get('expires_at', current_time):
+                        session_file.unlink()
+                        expired += 1
+                        continue
+                    
+                    session_id = session_file.stem
+                    self._sessions[session_id] = session
+                    loaded += 1
+                except Exception as e:
+                    print(f"[SessionManager] Failed to load {session_file.name}: {e}")
+                    # Remove corrupted file
+                    try:
+                        session_file.unlink()
+                    except:
+                        pass
+            
+            if loaded > 0 or expired > 0:
+                print(f"[SessionManager] Loaded {loaded} sessions, cleaned {expired} expired")
+        except Exception as e:
+            print(f"[SessionManager] Failed to load sessions: {e}")
     
     def create(self) -> str:
         """Create a new session with expiration."""
@@ -70,6 +172,7 @@ class SessionManager:
                 'expires_at': datetime.now() + timedelta(hours=self.SESSION_EXPIRY_HOURS),
                 'data': {}
             }
+            self._save_session(session_id)
             self._maybe_cleanup()
         
         return session_id
@@ -85,6 +188,7 @@ class SessionManager:
             # Check expiration
             if datetime.now() > session['expires_at']:
                 del self._sessions[session_id]
+                self._delete_session_file(session_id)
                 return None
             
             return session['data']
@@ -99,9 +203,11 @@ class SessionManager:
             
             if datetime.now() > session['expires_at']:
                 del self._sessions[session_id]
+                self._delete_session_file(session_id)
                 return False
             
             session['data'][key] = value
+            self._save_session(session_id)
             return True
     
     def delete(self, session_id: str) -> bool:
@@ -109,6 +215,7 @@ class SessionManager:
         with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
+                self._delete_session_file(session_id)
                 return True
             return False
     
@@ -131,6 +238,7 @@ class SessionManager:
         
         for sid in expired:
             del self._sessions[sid]
+            self._delete_session_file(sid)
         
         if expired:
             print(f"[SessionManager] Cleaned up {len(expired)} expired sessions")
