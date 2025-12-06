@@ -4,6 +4,7 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
+    2025-12-06 13:30: Added debug logging to diagnose session loss issue
     2025-12-06 13:00: CRITICAL FIX - Fixed /api/update and /api/download to properly
                       access session data. Override feature now works correctly.
     2025-12-06 12:45: Added file-based session persistence to survive deployments
@@ -20,6 +21,7 @@ FIXES APPLIED:
 4. File-based persistence for sessions (survives deployments with Railway Volume)
 5. CRITICAL: /api/update now properly updates document (was silently failing)
 6. CRITICAL: /api/download now returns updated document (was returning original)
+7. DEBUG: Added logging to track session creation and lookup
 """
 
 import os
@@ -452,6 +454,8 @@ def process_doc():
         
         # Create session to store results
         session_id = sessions.create()
+        print(f"[API] Created session {session_id[:8]}... for document {file.filename}")
+        
         sessions.set(session_id, 'processed_doc', processed_bytes)
         sessions.set(session_id, 'original_bytes', file_bytes)  # Store original for re-processing
         sessions.set(session_id, 'style', style)
@@ -468,6 +472,9 @@ def process_doc():
             for idx, r in enumerate(results)
         ])
         sessions.set(session_id, 'filename', secure_filename(file.filename))
+        
+        print(f"[API] Session {session_id[:8]} initialized with {len(results)} notes, doc size={len(processed_bytes)}")
+        print(f"[API] Total active sessions: {len(sessions._sessions)}")
         
         # Build notes list for UI
         notes = []
@@ -617,9 +624,14 @@ def update_note():
                 'error': 'Missing session_id or note_id'
             }), 400
         
+        # Debug: Log available sessions
+        print(f"[API] /api/update called for session={session_id[:8]}..., note={note_id}")
+        print(f"[API] Active sessions: {list(sessions._sessions.keys())[:5]}")  # First 5
+        
         # Get session data using proper thread-safe method
         session_data = sessions.get(session_id)
         if not session_data:
+            print(f"[API] Session {session_id[:8]} NOT FOUND in {len(sessions._sessions)} sessions")
             return jsonify({
                 'success': False,
                 'error': 'Session not found or expired'
@@ -629,6 +641,7 @@ def update_note():
         processed_doc = session_data.get('processed_doc')
         
         if not results or not processed_doc:
+            print(f"[API] Session {session_id[:8]} has incomplete data: results={bool(results)}, doc={bool(processed_doc)}")
             return jsonify({
                 'success': False,
                 'error': 'Session data incomplete'
@@ -687,7 +700,9 @@ def health():
     """Health check endpoint."""
     return jsonify({
         'status': 'healthy',
-        'version': '2.0.0'
+        'version': '2.0.1',
+        'sessions_count': len(sessions._sessions),
+        'persistence': sessions._persistence_available
     })
 
 
